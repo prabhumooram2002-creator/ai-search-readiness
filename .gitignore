@@ -28,3 +28,22 @@ Thumbs.db
 # Tests
 test_*.db
 coverage/
+
+# Scratch / experiment scripts (root-level one-offs)
+*.pyc
+test_*.py
+check_*.py
+convert_*.py
+debug_*.py
+load_cache.py
+re_crawl*.py
+report_crawl.py
+run_*.py
+generate_*.py
+*_out.txt
+*_out2.txt
+*_out3.txt
+*.out.txt
+*.out2.txt
+*.out3.txt
+logs/

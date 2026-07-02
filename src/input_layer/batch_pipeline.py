@@ -1,4 +1,4 @@
-"""Batch pipeline — run NormalizedQuery list through full Q&A + scoring pipeline.
+"""Batch pipeline -- run NormalizedQuery list through full Q&A + scoring pipeline.
 Phase 6 entry point: import <file> / analyze <text>"""
 from dataclasses import dataclass, field
 from typing import Optional
@@ -17,7 +17,7 @@ from ..connectivity_gate import compute_connectivity
 
 logger = get_logger(__name__)
 
-# ── Result types ──────────────────────────────────────────────────────────
+# -- Result types ----------------------------------------------------------
 
 @dataclass
 class GapResult:
@@ -37,9 +37,9 @@ class GapResult:
     recommendation: Optional[dict] = None
 
 
-# ── Root Cause Classifier (Phase 7) ───────────────────────────────────────
+# -- Root Cause Classifier (Phase 7) ---------------------------------------
 
-"""Batch pipeline — run NormalizedQuery list through full Q&A + scoring pipeline.
+"""Batch pipeline -- run NormalizedQuery list through full Q&A + scoring pipeline.
 Phase 6 entry point: import <file> / analyze <text>
 Phase 7: weak_edge, weak_node, alternative_path, hop_count, root_cause (10 cats)
 Phase 8: constrained recommendations (10 types + repairs), opportunity score (6-factor)
@@ -60,16 +60,16 @@ from . import parse_file, segment_text, NormalizedQuery, parse_expected_chain
 
 logger = get_logger(__name__)
 
-# ── Result types ──────────────────────────────────────────────────────────────
+# -- Result types --------------------------------------------------------------
 
 @dataclass
 class GapResult:
-    """Single query's enriched break-detection result — Phase 7/8."""
+    """Single query's enriched break-detection result -- Phase 7/8."""
     query: NormalizedQuery
     # Path detection (Phase 3)
     path_result: PathResult
     coverage: Optional[CoverageScore]
-    # Phase 7 — Root cause + enrichment
+    # Phase 7 -- Root cause + enrichment
     root_cause: str = "unknown"
     weak_edge: Optional[dict] = None      # {"src": ..., "tgt": ..., "confidence": float, "reason": str}
     weak_node: Optional[dict] = None      # {"node": ..., "degree": int, "罪名": str}
@@ -78,19 +78,19 @@ class GapResult:
     # Phase 8
     opportunity_score: float = 0.0
     recommendation: Optional[dict] = None  # {"action", "repairs", "detail", ...}
-    # v5/v6 — Page-level resolution & optimization
+    # v5/v6 -- Page-level resolution & optimization
     page_resolutions: list[dict] = field(default_factory=list)  # from PageMapper
     page_optimization: Optional[dict] = None                     # decision + suggested new page
-    # v4 — Connectivity Gate fields
+    # v4 -- Connectivity Gate fields
     connectivity_score: float = 0.0
     connectivity_tier: int = 0            # 0=notscored, 1=connected, 2=weak, 3=disconnected
     nearest_concept_name: str = ""
     nearest_concept_type: str = ""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 7 — ROOT CAUSE CLASSIFIER (10 categories)
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# PHASE 7 -- ROOT CAUSE CLASSIFIER (10 categories)
+# ==============================================================================
 
 def _node_degree(graph, node: str) -> int:
     """Return the degree (connection count) of a node, or 0 if not found."""
@@ -122,23 +122,23 @@ def _classify_root_cause(
     tgt_degree: int,
 ) -> str:
     """
-    Phase 7 — Rule-based root cause classifier, all 10 categories.
+    Phase 7 -- Rule-based root cause classifier, all 10 categories.
     Evaluated in priority order (most specific first).
     """
     pr = gap.path_result
     hops = pr.hops
     missing_rel = pr.missing_rel
 
-    # ── 1. missing_entity ─────────────────────────────────────────────
+    # -- 1. missing_entity ---------------------------------------------
     # Neither endpoint exists in the graph at all
     if src_node is None and tgt_node is None:
         return "missing_entity"
     if src_node is None or tgt_node is None:
         return "missing_entity"
 
-    # ── 2. conflicting_relationships ─────────────────────────────────
+    # -- 2. conflicting_relationships ---------------------------------
     # Both entities exist but have edges to each other with contradictory labels
-    # e.g. "X is spicy" vs "X is mild" — needs multi-edge check
+    # e.g. "X is spicy" vs "X is mild" -- needs multi-edge check
     try:
         src_rels = graph.query_related(src_node.get("name", pr.source))
         tgt_rels = graph.query_related(tgt_node.get("name", pr.target))
@@ -150,12 +150,12 @@ def _classify_root_cause(
     except Exception:
         pass
 
-    # ── 3. missing_relationship ────────────────────────────────────────
+    # -- 3. missing_relationship ----------------------------------------
     # Both entities present but no edge connects them
     if missing_rel:
         return "missing_relationship"
 
-    # ── 4. weak_edge ───────────────────────────────────────────────────
+    # -- 4. weak_edge ---------------------------------------------------
     # An edge exists (hop ≥ 1) but is weak: low degree endpoints + low evidence
     if hops >= 1:
         avg_degree = (src_degree + tgt_degree) / 2
@@ -167,12 +167,12 @@ def _classify_root_cause(
         if avg_degree <= 2 or evidence_weak:
             return "weak_edge"
 
-    # ── 5. weak_node ───────────────────────────────────────────────────
-    # Entity exists but is a leaf/orphan (degree ≤ 1) — hard to route through
+    # -- 5. weak_node ---------------------------------------------------
+    # Entity exists but is a leaf/orphan (degree ≤ 1) -- hard to route through
     if src_degree <= 1 or tgt_degree <= 1:
         return "weak_node"
 
-    # ── 6. isolated_graph_component ────────────────────────────────────
+    # -- 6. isolated_graph_component ------------------------------------
     # Both entities exist independently but are in separate disconnected components
     if hops == 0 and src_node and tgt_node and missing_rel is None:
         # Check if they have any shared neighbours
@@ -185,19 +185,19 @@ def _classify_root_cause(
         except Exception:
             pass
 
-    # ── 7. weak_topical_authority ──────────────────────────────────────
+    # -- 7. weak_topical_authority --------------------------------------
     # The target entity exists but has very few inbound citations/references
     # Proxy: target degree + coverage overall score
     if tgt_degree <= 3 and hops == 0:
         if gap.coverage and gap.coverage.overall < 0.4:
             return "weak_topical_authority"
 
-    # ── 8. sparse_supporting_content ──────────────────────────────────
+    # -- 8. sparse_supporting_content ----------------------------------
     # Entity exists with decent degree but semantic coverage is weak
     if gap.coverage and gap.coverage.semantic_coverage < 0.3:
         return "sparse_supporting_content"
 
-    # ── 9. missing_schema ─────────────────────────────────────────────
+    # -- 9. missing_schema ---------------------------------------------
     # Entity exists but has no schema_type annotation
     src_schema = _node_schema_type(graph, pr.source)
     tgt_schema = _node_schema_type(graph, pr.target)
@@ -206,24 +206,24 @@ def _classify_root_cause(
         if gap.query.intent == "informational" and hops == 0:
             return "missing_schema"
 
-    # ── 10. missing_faq ───────────────────────────────────────────────
+    # -- 10. missing_faq -----------------------------------------------
     # Question-shaped query (what/how/why/which/where) with no direct answer
     # detected via source coverage
     if any(w in gap.query.original.lower() for w in ["what", "how", "why", "which", "where", "who", "when"]):
         if gap.coverage and gap.coverage.semantic_coverage < 0.5:
             return "missing_faq"
 
-    # ── 11. weak_internal_linking ──────────────────────────────────────
+    # -- 11. weak_internal_linking --------------------------------------
     # Both entities exist but only via very long indirect paths (hops > 3)
     # suggesting poor internal linking structure
     if hops > 3:
         return "weak_internal_linking"
 
-    # ── Default ───────────────────────────────────────────────────────
+    # -- Default -------------------------------------------------------
     return "missing_relationship"
 
 
-# ── Opportunity Score (Phase 8) ───────────────────────────────────────────
+# -- Opportunity Score (Phase 8) -------------------------------------------
 
 @dataclass
 class OpportunityScorer:
@@ -241,12 +241,12 @@ class OpportunityScorer:
         w = self
         gap_entities = {e.lower() for e in gap.query.detected_entities}
 
-        # SearchDemand — normalized volume (0-1) or frequency proxy
+        # SearchDemand -- normalized volume (0-1) or frequency proxy
         demand = 0.5  # default if no volume
         if gap.query.volume:
             demand = min(1.0, gap.query.volume / 1000.0)
 
-        # BusinessValue — configurable, default 0.5
+        # BusinessValue -- configurable, default 0.5
         business = 0.5
         for e in gap_entities:
             if e in self.entity_weights:
@@ -256,10 +256,10 @@ class OpportunityScorer:
         if gap_entities & hero_entities:
             business = max(business, 0.7)
 
-        # GraphCentrality — how many other gaps share the same missing node/edge
+        # GraphCentrality -- how many other gaps share the same missing node/edge
         centrality = min(1.0, centrality_hit_count / 5.0)
 
-        # AIReasoningImpact — hops away from complete answer (fewer hops = higher)
+        # AIReasoningImpact -- hops away from complete answer (fewer hops = higher)
         if gap.path_result.hops >= 3:
             reasoning = 0.2
         elif gap.path_result.hops == 2:
@@ -269,13 +269,13 @@ class OpportunityScorer:
         else:
             reasoning = 1.0  # 0 hops = already answered
 
-        # EvidenceWeakness — inverse of confidence
+        # EvidenceWeakness -- inverse of confidence
         conf = 0.7  # default
         if gap.coverage and gap.coverage.evidence_strength:
             conf = 1.0 - gap.coverage.evidence_strength
         evidence = min(1.0, conf)
 
-        # ContentEffort — hard to fix vs easy (FAQ=easy, new page=hard)
+        # ContentEffort -- hard to fix vs easy (FAQ=easy, new page=hard)
         effort = 0.5
         if gap.root_cause in ("missing_faq", "weak_evidence", "missing_schema"):
             effort = 0.2  # easy
@@ -295,7 +295,7 @@ class OpportunityScorer:
         return round(score, 4)
 
 
-# ── Recommendation Generator (Phase 8) ───────────────────────────────────
+# -- Recommendation Generator (Phase 8) -----------------------------------
 
 RECOMMENDATION_ACTIONS = [
     "create_relationship",
@@ -313,7 +313,7 @@ RECOMMENDATION_ACTIONS = [
 
 def generate_recommendation(gap: GapResult) -> dict:
     """
-    Phase 8 — Constrained recommendation with GAP-SPECIFIC repairs statement.
+    Phase 8 -- Constrained recommendation with GAP-SPECIFIC repairs statement.
     Action is one of 10 types. repairs field explains exactly what semantic
     relationship is broken and how to repair it (never 'add keyword').
     """
@@ -321,9 +321,9 @@ def generate_recommendation(gap: GapResult) -> dict:
     tgt = gap.path_result.target or ""
     rc = gap.root_cause
     hops = gap.hop_count
-    break_pt = gap.path_result.break_point or f"{src} → {tgt}"
+    break_pt = gap.path_result.break_point or f"{src} -> {tgt}"
 
-    # ── Action type mapping (one of 10) ─────────────────────────────────
+    # -- Action type mapping (one of 10) ---------------------------------
     action_map = {
         "missing_entity":              "create_supporting_entity",
         "missing_relationship":       "create_relationship",
@@ -339,7 +339,7 @@ def generate_recommendation(gap: GapResult) -> dict:
     }
     action = action_map.get(rc, "create_relationship")
 
-    # ── Repairs: gap-specific statement of what semantic path is broken ──
+    # -- Repairs: gap-specific statement of what semantic path is broken --
     # Format: "Repair: [broken relationship]. By: [specific action]."
     repairs_map = {
         "missing_relationship": (
@@ -356,7 +356,7 @@ def generate_recommendation(gap: GapResult) -> dict:
             f"Repair: the edge between '{src}' and '{tgt}' has low confidence "
             f"(low endpoint degree + weak evidence). "
             f"By: add 2-3 attribute statements and citations that reinforce the "
-            f"'{src} → {tgt}' relationship."
+            f"'{src} -> {tgt}' relationship."
         ),
         "weak_node": (
             f"Repair: '{tgt}' is a leaf node (degree ≤ 1) and cannot be routed to. "
@@ -367,26 +367,26 @@ def generate_recommendation(gap: GapResult) -> dict:
             f"Repair: the query '{gap.query.original[:60]}' is a question-type "
             f"search but no FAQ content directly answers it. "
             f"By: add an FAQ entry on the '{src}' page that explicitly answers "
-            f"the question and includes the '{src} → {tgt}' relationship."
+            f"the question and includes the '{src} -> {tgt}' relationship."
         ),
         "sparse_supporting_content": (
-            f"Repair: semantic coverage for '{src} → {tgt}' is weak (low citation density). "
+            f"Repair: semantic coverage for '{src} -> {tgt}' is weak (low citation density). "
             f"By: expand the '{tgt}' page with 2-3 additional supporting sections "
             f"covering attributes, comparisons, or use-cases."
         ),
         "weak_internal_linking": (
-            f"Repair: '{src}' and '{tgt}' require {hops} hops to connect — "
+            f"Repair: '{src}' and '{tgt}' require {hops} hops to connect -- "
             f"internal link structure is too shallow. "
             f"By: add direct hyperlinks from the '{src}' page to '{tgt}' "
             f"and from at least one intermediate page."
         ),
         "missing_schema": (
-            f"Repair: the '{src}' → '{tgt}' relationship has no structured data markup. "
+            f"Repair: the '{src}' -> '{tgt}' relationship has no structured data markup. "
             f"By: add JSON-LD (Product/FAQ/HowTo schema) to the '{src}' page "
             f"marking up the relationship with type, properties, and expected answer."
         ),
         "weak_topical_authority": (
-            f"Repair: '{tgt}' has low inbound reference density — "
+            f"Repair: '{tgt}' has low inbound reference density -- "
             f"appears unconnected to the broader topical graph. "
             f"By: create 2-3 supporting articles that reference '{tgt}' "
             f"with natural mentions and cross-links."
@@ -399,7 +399,7 @@ def generate_recommendation(gap: GapResult) -> dict:
         ),
         "conflicting_relationships": (
             f"Repair: '{src}' has multiple outgoing edges with contradictory "
-            f"relationship labels — AI engines will detect inconsistency. "
+            f"relationship labels -- AI engines will detect inconsistency. "
             f"By: audit all edges from '{src}' and resolve to a single "
             f"consistent relationship type, then add authoritative citation."
         ),
@@ -410,7 +410,7 @@ def generate_recommendation(gap: GapResult) -> dict:
         f"By: add explicit relationship content."
     )
 
-    # ── Detail: implementation guide (what exactly to write/create/link) ─
+    # -- Detail: implementation guide (what exactly to write/create/link) -
     detail_map = {
         "create_relationship": (
             f"Write a content block: 'About {src}: [{src}] {get_suggested_rel(src, tgt)} [{tgt}]. "
@@ -449,7 +449,7 @@ def generate_recommendation(gap: GapResult) -> dict:
             f"url must point to the canonical '{src}' page URL."
         ),
         "add_authoritative_reference": (
-            f"Find an authoritative external source that mentions the '{src} → {tgt}' "
+            f"Find an authoritative external source that mentions the '{src} -> {tgt}' "
             f"relationship (official docs, recognized authority). Add as citation with "
             f"anchor text and structured citation schema."
         ),
@@ -481,7 +481,7 @@ def generate_recommendation(gap: GapResult) -> dict:
         ) else "medium" if rc in (
             "weak_edge", "weak_node", "missing_faq"
         ) else "low",
-        # v5/v6 — Page-level resolution
+        # v5/v6 -- Page-level resolution
         "page_resolutions": gap.page_resolutions,
         "page_decision": gap.page_optimization["recommendation_type"] if gap.page_optimization else None,
         "page_decision_reason": gap.page_optimization["reason"] if gap.page_optimization else None,
@@ -490,7 +490,7 @@ def generate_recommendation(gap: GapResult) -> dict:
     }
 
 
-# ── Batch Pipeline ────────────────────────────────────────────────────────
+# -- Batch Pipeline --------------------------------------------------------
 
 async def run_batch_audit(
     queries: list[NormalizedQuery],
@@ -498,9 +498,9 @@ async def run_batch_audit(
 ) -> list[GapResult]:
     """
     Run a batch of NormalizedQuery objects through the full pipeline:
-    embed → vector search → hybrid retrieval → broken path detection
-    → root cause classification → coverage scoring → opportunity scoring
-    → recommendation generation.
+    embed -> vector search -> hybrid retrieval -> broken path detection
+    -> root cause classification -> coverage scoring -> opportunity scoring
+    -> recommendation generation.
 
     Returns list[GapResult], one per query.
     """
@@ -578,7 +578,7 @@ async def _process_single_query(
             coverage=None,
         )
 
-    # ── v4 Stage 0: Semantic Connectivity Gate ────────────────────────
+    # -- v4 Stage 0: Semantic Connectivity Gate ------------------------
     gate_result = await compute_connectivity(
         nq.canonical, q_emb, vs, graph
     )
@@ -592,7 +592,7 @@ async def _process_single_query(
         nearest_concept_type=gate_result.nearest_entity_type or "chunk",
     )
 
-    # Tier 3 — Disconnected: skip chain extraction, return disconnection report
+    # Tier 3 -- Disconnected: skip chain extraction, return disconnection report
     if gate_result.tier >= 3:
         gap.root_cause = "disconnected"
         gap.path_result = PathResult(
@@ -603,7 +603,7 @@ async def _process_single_query(
         )
         return gap
 
-    # Tier 1/2 — Connected/Weak: proceed to full v3 pipeline
+    # Tier 1/2 -- Connected/Weak: proceed to full v3 pipeline
     gap.connectivity_tier = gate_result.tier
 
     # Vector search
@@ -642,11 +642,11 @@ async def _process_single_query(
     gap.path_result = path_result
     gap.hop_count = len(entity_chain) - 1 if entity_chain else 0
 
-    # Phase 7: root cause — now passes full gap + graph metadata
+    # Phase 7: root cause -- now passes full gap + graph metadata
     root_cause = _classify_root_cause(gap, graph, src_node, tgt_node, src_degree, tgt_degree)
     gap.root_cause = root_cause
 
-    # ── Populate weak_edge ───────────────────────────────────────────────────
+    # -- Populate weak_edge ---------------------------------------------------
     if root_cause == "weak_edge" and src_node and tgt_node:
         gap.weak_edge = {
             "src": path_result.source,
@@ -660,7 +660,7 @@ async def _process_single_query(
             ),
         }
 
-    # ── Populate weak_node ──────────────────────────────────────────────────
+    # -- Populate weak_node --------------------------------------------------
     if root_cause in ("weak_node", "isolated_graph_component") and (src_node or tgt_node):
         weak_name = path_result.source if src_degree <= 1 else path_result.target
         weak_degree = src_degree if src_degree <= 1 else tgt_degree
@@ -669,10 +669,10 @@ async def _process_single_query(
             "node": weak_name,
             "degree": weak_degree,
             "罪名": 罪名,
-            "reason": f"Node '{weak_name}' is a {罪名} — cannot be routed to/from by AI engines.",
+            "reason": f"Node '{weak_name}' is a {罪名} -- cannot be routed to/from by AI engines.",
         }
 
-    # ── Populate alternative_path ─────────────────────────────────────────
+    # -- Populate alternative_path -----------------------------------------
     if graph and path_result.source and path_result.target:
         try:
             alt_paths = graph.find_paths(path_result.source, path_result.target, max_hops=3)
@@ -702,10 +702,10 @@ async def _process_single_query(
                 vector_store=vs,
                 graph=graph,
             )
-            # v5/v6 — Knowledge Graph Completeness + page-level resolution
+            # v5/v6 -- Knowledge Graph Completeness + page-level resolution
             if coverage and entity_chain:
                 from ..page_mapper import PageMapper
-                mapper = PageMapper([])  # lightweight — just needs graph queries
+                mapper = PageMapper([])  # lightweight -- just needs graph queries
                 chain_resolved = mapper.resolve_chain(entity_chain, graph)
                 nodes_present = sum(1 for r in chain_resolved if r.status == "found")
                 coverage.kg_completeness = nodes_present / max(len(entity_chain), 1)
@@ -730,17 +730,17 @@ async def _process_single_query(
             logger.warning(f"Coverage scoring failed: {e}")
     gap.coverage = coverage
 
-    # ── Phase 7: re-classify once coverage is available ─────────────────
+    # -- Phase 7: re-classify once coverage is available -----------------
     # Re-run root cause now that coverage is populated
     gap.root_cause = _classify_root_cause(gap, graph, src_node, tgt_node, src_degree, tgt_degree)
 
     return gap
 
 
-# ── CLI-facing helpers ────────────────────────────────────────────────────
+# -- CLI-facing helpers ----------------------------------------------------
 
 async def audit_file(path: str) -> list[GapResult]:
-    """Load and process a file — auto-detects format."""
+    """Load and process a file -- auto-detects format."""
     logger.info(f"Auditing file: {path}")
     queries = parse_file(path)
     logger.info(f"Parsed {len(queries)} queries from {path}")
@@ -764,7 +764,7 @@ async def audit_text(text: str) -> list[GapResult]:
 
 
 def print_batch_summary(results: list[GapResult]) -> None:
-    """Print compact summary of batch results to console — v4 three-bucket."""
+    """Print compact summary of batch results to console -- v4 three-bucket."""
     if not results:
         print("No results.")
         return
@@ -777,7 +777,7 @@ def print_batch_summary(results: list[GapResult]) -> None:
     avg_score = sum(g.opportunity_score for g in results if g.root_cause != "disconnected") / max(connected, 1)
 
     print(f"\n{'='*60}")
-    print(f"  BATCH SUMMARY — {len(results)} queries")
+    print(f"  BATCH SUMMARY -- {len(results)} queries")
     print(f"{'='*60}")
     print(f"  Connected / Analyzed:      {connected:>4}")
     print(f"  Disconnected (Tier 3):     {disconnected:>4}")
@@ -852,7 +852,7 @@ def _serialize_results(results: list[GapResult]) -> list[dict]:
                 "overall": g.coverage.overall,
                 "verdict": g.coverage.verdict,
             },
-            # Phase 7 — enriched break detection
+            # Phase 7 -- enriched break detection
             "root_cause": g.root_cause,
             "weak_edge": g.weak_edge,
             "weak_node": g.weak_node,
@@ -861,7 +861,7 @@ def _serialize_results(results: list[GapResult]) -> list[dict]:
             # Phase 8
             "opportunity_score": g.opportunity_score,
             "recommendation": g.recommendation,
-            # v4 — Connectivity Gate
+            # v4 -- Connectivity Gate
             "connectivity_score": g.connectivity_score,
             "connectivity_tier": g.connectivity_tier,
             "nearest_concept_name": g.nearest_concept_name,
