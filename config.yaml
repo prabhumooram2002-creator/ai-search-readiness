@@ -1,0 +1,68 @@
+# AI Search Readiness Platform — Configuration
+# Non-secret tunables for Phase 1 (Crawl + Chunk + Embed + Vector Q&A)
+
+# ─── Crawling ────────────────────────────────────────────────
+crawl:
+  max_pages: 120         # cap pages per audit
+  max_depth: 3          # link-following depth (blog posts are at depth 2 from homepage)
+  respect_robots_txt: true
+  use_playwright: true   # auto-detect JS-rendered pages
+  delay_ms: 2000          # polite delay (raised from 500 — Cloudflare rate limits aggressively)
+  user_agent: "AI-Search-Readiness-Bot/2.0 (+https://github.com/ngstcf/ai-seo-auditor)"
+
+# ─── Chunking ────────────────────────────────────────────────
+chunk:
+  chunk_size: 512        # tokens per chunk
+  chunk_overlap: 64      # overlap to preserve context
+  min_chunk_length: 50   # discard chunks below this chars
+
+# ─── Embeddings ───────────────────────────────────────────────
+embed:
+  # Provider priority — first available wins
+  # Options: nvidia (free), deepseek (paid)
+  provider_priority:
+    - nvidia
+    - deepseek
+  # NVIDIA NIM free tier — confirmed working:
+  #   Embeddings: nvidia/nv-embed-v1 (4096 dim, 200 OK)
+  #   Chat: nvidia/llama-3.3-nemotron-super-49b-v1 (200 OK)
+  nvidia_embed_model: nvidia/nv-embed-v1
+  nvidia_chat_model: nvidia/llama-3.3-nemotron-super-49b-v1
+  deepseek_embed_model: text-embedding-3-small
+  deepseek_chat_model: deepseek-chat
+  batch_size: 20
+  cache_dir: data/.embed_cache
+
+# ─── Vector Store ─────────────────────────────────────────────
+vector:
+  provider: chromadb     # chromadb (local) | qdrant (cloud, Phase 2+)
+  collection_name: ai_search_chunks
+  top_k: 5               # default retrieved chunks per query
+  persist_directory: data/chromadb
+
+# ─── Q&A ──────────────────────────────────────────────────────
+qa:
+  # Provider priority for chat summarization / answer generation
+  provider_priority:
+    - nvidia
+    - deepseek
+  nvidia_chat_model: nvidia/llama-3.3-nemotron-super-49b-v1
+  deepseek_chat_model: deepseek-chat
+  max_tokens: 512
+  temperature: 0.3
+
+# ─── Scoring (Phase 4+) ───────────────────────────────────────
+scoring:
+  weights:
+    entity_coverage: 0.35
+    relationship_coverage: 0.35
+    semantic_coverage: 0.20
+    evidence_strength: 0.10
+  verdict_thresholds:
+    yes: 0.75
+    partially: 0.40
+
+# ─── Logging ─────────────────────────────────────────────────
+log:
+  level: INFO
+  file: logs/audit.log
