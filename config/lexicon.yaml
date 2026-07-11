@@ -1,0 +1,30 @@
+# Domain / brand lexicon for the input layer.
+#
+# EMPTY BY DEFAULT — the shipped tool has no brand or domain coupling. Populate
+# per project to enable synonym normalization, rule-based entity extraction, and
+# expected-chain inference in src/input_layer. Every section is optional; a
+# missing or empty section means "no entries" (the input layer degrades to
+# generic, brand-agnostic behavior).
+#
+# Schema (all maps are lowercased-key -> value):
+#   synonyms:       "phrase"            -> "Canonical phrase"     (query normalization)
+#   slang:          " raw "             -> " replacement "        (literal substring swap)
+#   noise_patterns: [regex, ...]        stripped from query text
+#   brands:         "substring"         -> "Canonical Entity"
+#   product_types:  "keyword"           -> "Entity"
+#   ingredients:    "keyword"           -> "Entity"
+#   attributes:     "keyword"           -> "Attribute"
+#   hero_entities:  ["entity", ...]      lowercased names that get a business boost
+#   default_root:   "Entity" | null      fallback root for expected-chain (null = off)
+#   default_brand:  "Entity" | null      fallback brand for expected-chain (null = off)
+
+synonyms: {}
+slang: {}
+noise_patterns: []
+brands: {}
+product_types: {}
+ingredients: {}
+attributes: {}
+hero_entities: []
+default_root: null
+default_brand: null

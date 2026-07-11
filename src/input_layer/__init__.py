@@ -1,7 +1,14 @@
 """Universal Input Layer — Phase 6.
 Any input format (file, pasted text, interactive) normalizes to
 the same internal representation before hitting the graph pipeline.
+
+Brand / domain lexicon is NOT hardcoded here. It is loaded from
+``config/lexicon.yaml`` (empty by default), so the shipped input layer has zero
+brand coupling and degrades to generic, brand-agnostic behavior. Populate that
+file per project to re-enable synonym normalization and rule-based entity
+extraction. Override the path with the ``LEXICON_PATH`` env var.
 """
+import os
 import json
 import re
 import csv
@@ -18,39 +25,51 @@ logger = get_logger(__name__)
 
 INTENT_TYPES = ["informational", "comparison", "transactional", "diagnostic"]
 
-# ── Semantic normalization map ─────────────────────────────────────────────
+# ── Externalized domain lexicon (config/lexicon.yaml, EMPTY by default) ─────
 
-_SYNONYMS = {
-    "wickedgud": "WickedGüd", "wicked gud": "WickedGüd", "wicked good": "WickedGüd",
-    "atta": "whole wheat", "atta maggi": "atta noodles",
-    "maggie": "maggi",
-    "paasata": "pasta", "pastaa": "pasta",
-    "no maida": "zero maida", "zero-maida": "zero maida",
-    "no palm oil": "zero palm oil", "zero-palm-oil": "zero palm oil",
-    "high protein": "high protein",
-    "healthy noodles": "healthy noodles", "healthier noodles": "healthy noodles",
-    "protein pasta": "protein pasta", "protein noodles": "protein noodles",
-    "instant noodles": "instant noodles", "instant ramen": "instant ramen",
-    "veg": "vegetarian", "vegetarian": "vegetarian",
-    "cup noodles": "cup noodles", "cup ramen": "cup ramen",
-    "packet noodles": "packet noodles", "pack noodles": "packet noodles",
-    "ramen noodles": "ramen", "noodle ramen": "ramen",
-    "spam": "spicy", "spicy": "spicy",
-    "cheapest": "affordable", "price": "price",
-}
+try:
+    import yaml as _yaml
+except Exception:  # pragma: no cover - yaml is a core dep, guard anyway
+    _yaml = None
 
-_SLANG = {
-    " gud ": " good ", "gud ": "good ", " gud": " good",
-    " tho ": " though ", "tho ": "though ",
-    " tho": " though",
-    " n ": " and ",
-}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_NOISE_PATTERNS = [
-    r"^(what is|what are|how to|how do|where can|where is|which is|who makes|why is|can i|is there)\s+",
-    r"\s*(review|reviews|price|prices|buy|order|shop|cost|buy online)\s*$",
-    r"^(best|top|cheap|affordable)\s+(?=noodles|pasta|ramen|maggi)",
-]
+
+def _load_lexicon() -> dict:
+    """Load the domain lexicon from config/lexicon.yaml.
+
+    Every section defaults to empty, so a missing/empty file yields a fully
+    brand-agnostic lexicon. Never raises — a malformed file logs a warning and
+    falls back to empty.
+    """
+    path = Path(os.getenv("LEXICON_PATH", str(_REPO_ROOT / "config" / "lexicon.yaml")))
+    data: dict = {}
+    if _yaml is not None and path.exists():
+        try:
+            data = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            logger.warning(f"lexicon load failed ({path}): {e}; using empty lexicon")
+            data = {}
+    return {
+        "synonyms": dict(data.get("synonyms") or {}),
+        "slang": dict(data.get("slang") or {}),
+        "noise_patterns": list(data.get("noise_patterns") or []),
+        "brands": dict(data.get("brands") or {}),
+        "product_types": dict(data.get("product_types") or {}),
+        "ingredients": dict(data.get("ingredients") or {}),
+        "attributes": dict(data.get("attributes") or {}),
+        "hero_entities": [str(e).lower() for e in (data.get("hero_entities") or [])],
+        "default_root": data.get("default_root"),
+        "default_brand": data.get("default_brand"),
+    }
+
+
+_LEX = _load_lexicon()
+
+
+def hero_entities() -> set[str]:
+    """Lowercased entity names that receive a business-value boost (empty by default)."""
+    return set(_LEX["hero_entities"])
 
 
 @dataclass
@@ -100,7 +119,7 @@ def _parse_txt(path: Path) -> list[NormalizedQuery]:
     lines = _auto_decode(path).splitlines()
     # Skip first line if it looks like a header (contains 'keyword' in lowercase, short, multiple tabs)
     start = 0
-    if lines and lines[0].lower().strip() in ("keyword", "\ufeffkeyword", "keyword\t\t\t"):
+    if lines and lines[0].lower().strip() in ("keyword", "﻿keyword", "keyword\t\t\t"):
         start = 1
     for i, line in enumerate(lines[start:], start + 1):
         line = line.strip()
@@ -299,25 +318,29 @@ def segment_text(text: str) -> list[NormalizedQuery]:
 # ── Semantic normalization ─────────────────────────────────────────────────
 
 def _semantic_normalize(text: str) -> str:
-    """Strip noise, resolve synonyms, canonicalize phrasing."""
+    """Strip noise, resolve synonyms, canonicalize phrasing.
+
+    All noise patterns / slang / synonyms come from the externalized lexicon
+    (empty by default → only generic cleanup: URL/markdown strip + whitespace).
+    """
     text = text.lower().strip()
 
     # Remove URL fragments / markdown
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # md links → text
 
-    # Remove leading noise patterns
-    for pattern in _NOISE_PATTERNS:
+    # Remove configured noise patterns
+    for pattern in _LEX["noise_patterns"]:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
 
     # Slang resolution
-    for slang, replacement in _SLANG.items():
+    for slang, replacement in _LEX["slang"].items():
         text = text.replace(slang, replacement)
 
-    # Synonym resolution
-    for phrase, canonical in sorted(_SYNONYMS.items(), key=lambda x: -len(x[0])):
+    # Synonym resolution (longest phrase first)
+    for phrase, canonical in sorted(_LEX["synonyms"].items(), key=lambda x: -len(x[0])):
         if phrase in text:
-            text = text.replace(phrase, canonical)
+            text = text.replace(phrase, str(canonical))
 
     # Collapse extra whitespace
     text = re.sub(r"\s+", " ", text).strip()
@@ -328,7 +351,7 @@ def _semantic_normalize(text: str) -> str:
 # ── Intent detection ───────────────────────────────────────────────────────
 
 def _detect_intent(text: str) -> str:
-    """Classify query intent type."""
+    """Classify query intent type using generic, brand-agnostic signals."""
     text_lower = text.lower()
 
     if any(k in text_lower for k in ["compare", "vs ", "versus", "difference between", "better", "best", "top ", "reviews"]):
@@ -343,47 +366,21 @@ def _detect_intent(text: str) -> str:
 # ── Entity extraction from query text ───────────────────────────────────────
 
 def _extract_entities_from_query(text: str) -> list[str]:
-    """Fast rule-based entity extraction from query string (no LLM needed)."""
+    """Rule-based entity extraction driven by the externalized lexicon.
+
+    With the default (empty) lexicon this returns [] — no brand assumptions.
+    """
     text_lower = text.lower()
-    entities = []
+    entities: list[str] = []
 
-    # Brand — normalize all variants to match graph's stored name
-    brand_text = text_lower.replace("ü", "u").replace("ue", "u")
-    if any(k in brand_text for k in ["wickedgud", "wicked gud", "wicked good"]):
-        entities.append("WickedGüd")
-    if "maggi" in text_lower:
-        entities.append("Maggi")
-    if "samyang" in text_lower:
-        entities.append("Samyang")
-    if "nissin" in text_lower:
-        entities.append("Nissin")
-    if "top ramen" in text_lower:
-        entities.append("TopRamen")
-
-    # Product types
-    for kw, entity in [
-        ("noodles", "Noodles"), ("ramen", "Ramen"), ("pasta", "Pasta"),
-        ("spaghetti", "Spaghetti"), ("macaroni", "Macaroni"),
-        ("wraps", "Wraps"), ("combos", "Combos"), ("byob", "BYOB"),
-        ("atta noodles", "Atta Noodles"), ("millet noodles", "Millet Noodles"),
-        ("quinoa noodles", "Quinoa Noodles"), ("rice noodles", "Rice Noodles"),
-        ("whole wheat pasta", "Whole Wheat Pasta"), ("protein pasta", "Protein Pasta"),
-        ("instant noodles", "Instant Noodles"), ("instant ramen", "Instant Ramen"),
-        ("cup noodles", "Cup Noodles"), ("packet noodles", "Packet Noodles"),
-    ]:
-        if kw in text_lower:
+    for substr, entity in _LEX["brands"].items():
+        if substr in text_lower:
             entities.append(entity)
-
-    # Ingredients / health
-    for kw, entity in [
-        ("maida", "Zero Maida"), ("atta", "Whole Wheat"), ("millet", "Millet"),
-        ("quinoa", "Quinoa"), ("rice flour", "Rice Flour"),
-        ("protein", "High Protein"), ("gluten free", "Gluten Free"),
-        ("no palm oil", "Zero Palm Oil"), ("zero oil", "Zero Palm Oil"),
-        ("high fiber", "High Fiber"), ("no artificial", "No Artificial Colors"),
-    ]:
-        if kw in text_lower:
-            entities.append(entity)
+    # product types then ingredients (longest keyword first for specificity)
+    for section in ("product_types", "ingredients"):
+        for kw, entity in sorted(_LEX[section].items(), key=lambda x: -len(x[0])):
+            if kw in text_lower:
+                entities.append(entity)
 
     # Deduplicate preserving order
     seen = set()
@@ -399,123 +396,82 @@ def _extract_entities_from_query(text: str) -> list[str]:
 # ── Expected entity chain from query ──────────────────────────────────────
 
 def parse_expected_chain(nq: NormalizedQuery, graph=None) -> list[str]:
-    """
-    Given a NormalizedQuery, return the expected entity reasoning chain.
-    Uses detected_entities + heuristics to build an ordered list.
-    Guarantees at least 2 distinct entities.
+    """Return the expected entity reasoning chain for a NormalizedQuery.
 
-    E.g. "healthy noodles for diabetics" -> ["Healthy Noodles", "Diabetes-Safe", "Low Glycemic"]
-    E.g. "wickedgud noodles price"       -> ["WickedGud", "Noodles", "Price"]
-    E.g. "maggi calories"                -> ["Maggi", "Calories"]
+    Chain inference is lexicon-driven. With the default (empty) lexicon there
+    are no product/brand defaults, so this returns the detected entities as-is
+    (possibly fewer than 2) and logs an incomplete-chain warning rather than
+    inventing brand nodes.
     """
     entities = list(nq.detected_entities)
+    root = _LEX["default_root"]
+    brand = _LEX["default_brand"]
+    product_kws = list(_LEX["product_types"].keys())
 
-    # Heuristic: add inferred intermediate nodes
-    has_product = any(e.lower() in ["noodles", "pasta", "ramen", "spaghetti", "wraps", "combos", "byob"] for e in entities)
-    has_brand = any(b in entities for b in ["WickedGüd", "WickedGud", "Wicked Gud", "wickedgud"])
+    has_product = any(any(pk in e.lower() for pk in product_kws) for e in entities) if product_kws else False
+    has_brand = bool(brand) and any(brand.lower() == e.lower() for e in entities)
 
     if has_brand and not has_product:
-        # "wickedgud noodles" -> brand is start, product inferred
         inferred = _infer_product_type(nq.canonical)
         if inferred and inferred not in entities:
             entities.append(inferred)
 
     if has_brand and has_product:
-        # Add attribute if query mentions health/price/compare
         attr = _infer_attribute(nq.canonical)
         if attr and attr not in entities:
             entities.append(attr)
 
-    # -- ENSURE at least 2 DISTINCT entities -------------------------------
+    # -- Try to reach 2 distinct entities via attributes -------------------
     if len(entities) < 2:
-        # Try extracting an attribute from the canonical text
         attr = _infer_attribute(nq.canonical)
         if attr and attr not in entities:
             entities.append(attr)
 
     if len(entities) < 2:
-        # Try looking for a second concept in the original query text
-        # (e.g. "maggi calories" -> "calories" maps to "Calories")
         second = _infer_attribute(nq.original)
         if second and second not in entities:
             entities.append(second)
 
-    if len(entities) < 2:
-        # Fallback: link the query entity to the site root category
-        root = "Noodles"
+    # -- Lexicon-driven fallback (only when a default_root is configured) ---
+    if len(entities) < 2 and root:
         if entities:
-            # If single entity is not the root, add root
             if entities[0].lower() != root.lower():
                 entities.append(root)
-            else:
-                # If single entity IS the root, add "WickedGud" as brand context
-                entities.insert(0, "WickedGud")
+            elif brand:
+                entities.insert(0, brand)
         else:
-            # No entities at all — use query canonical as first node + root
-            entities = [nq.canonical.capitalize(), root]
+            entities = [nq.canonical.capitalize(), root] if nq.canonical else [root]
 
-    # -- Validation: reject same-entity chains ------------------------------
+    # -- Validation: reject consecutive-duplicate chains --------------------
     if len(entities) >= 2:
-        if entities[0].lower() == entities[1].lower():
-            # Duplicate entities — insert root between them
-            entities.insert(1, "Noodles")
-        # Remove consecutive duplicates while preserving order
+        if entities[0].lower() == entities[1].lower() and root:
+            entities.insert(1, root)
         deduped = [entities[0]]
         for e in entities[1:]:
             if e.lower() != deduped[-1].lower():
                 deduped.append(e)
         entities = deduped
 
-    # Log if chain collapsed to < 2 after dedup (should be rare)
     if len(entities) < 2:
-        logger = __import__('logging').getLogger(__name__)
-        logger.warning(f"chain_extraction_failed: query='{nq.original}' entities={list(nq.detected_entities)}")
+        logger.warning(
+            f"chain_extraction_incomplete: query='{nq.original}' "
+            f"entities={list(nq.detected_entities)} (empty/insufficient lexicon)"
+        )
 
     return entities
 
 
-def _infer_product_type(canonical: str) -> str:
-    # Multi-word product types
-    for kw, entity in [
-        ("millet noodles", "Millet Noodles"),
-        ("quinoa noodles", "Quinoa Noodles"),
-        ("rice noodles", "Rice Noodles"),
-        ("atta noodles", "Atta Noodles"),
-        ("whole wheat pasta", "Whole Wheat Pasta"),
-        ("protein pasta", "Protein Pasta"),
-        ("instant noodles", "Instant Noodles"),
-        ("instant ramen", "Instant Ramen"),
-        ("cup noodles", "Cup Noodles"),
-        ("packet noodles", "Packet Noodles"),
-        ("healthy noodles", "Healthy Noodles"),
-        ("protein noodles", "Protein Noodles"),
-        ("korean noodles", "Korean Noodles"),
-        ("spicy noodles", "Spicy Noodles"),
-        ("spicy ramen", "Spicy Ramen"),
-        ("ramen noodles", "Ramen"),
-        ("noodle ramen", "Ramen"),
-        ("noodles ramen", "Ramen"),
-        ("noodles packet", "Packet Noodles"),
-        ("maggi noodles", "Maggi Noodles"),
-        ("maggi pasta", "Maggi Pasta"),
-        ("maggi calories", "Maggi"),
-    ]:
+def _infer_product_type(canonical: str) -> str | None:
+    """Longest-match product type from the lexicon, else the configured default_root (or None)."""
+    for kw, entity in sorted(_LEX["product_types"].items(), key=lambda x: -len(x[0])):
         if kw in canonical:
             return entity
-    return "Noodles"  # default
+    return _LEX["default_root"]
 
 
 def _infer_attribute(canonical: str) -> str | None:
-    for kw, attr in [
-        ("calori", "Calories"), ("price", "Price"), ("cost", "Price"),
-        ("protein", "High Protein"), ("fiber", "High Fiber"),
-        ("maida", "Zero Maida"), ("palm oil", "Zero Palm Oil"),
-        ("artificial", "No Artificial Colors"), ("trans fat", "No Trans Fat"),
-        ("gluten", "Gluten Free"), ("diabet", "Diabetes-Safe"),
-        ("low gly", "Low Glycemic"), ("spicy", "Spicy"),
-        ("vegan", "Vegan"), ("veg", "Vegetarian"), ("organic", "Organic"),
-        ("compare", "Comparison"), ("review", "Reviews"),
-    ]:
+    """First matching attribute from the lexicon (None if unmatched / empty lexicon)."""
+    for kw, attr in _LEX["attributes"].items():
         if kw in canonical:
             return attr
     return None

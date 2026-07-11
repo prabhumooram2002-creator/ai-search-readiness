@@ -251,9 +251,9 @@ class OpportunityScorer:
         for e in gap_entities:
             if e in self.entity_weights:
                 business = max(business, self.entity_weights[e])
-        # Hero products get a boost
-        hero_entities = {"wickedgüd", "noodles", "pasta", "ramen", "combos"}
-        if gap_entities & hero_entities:
+        # Hero products get a boost (lexicon-driven; empty by default)
+        from . import hero_entities as _hero_entities
+        if gap_entities & _hero_entities():
             business = max(business, 0.7)
 
         # GraphCentrality -- how many other gaps share the same missing node/edge
