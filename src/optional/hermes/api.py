@@ -164,6 +164,10 @@ class HermesAPI:
         self.worker = HermesWorker(self.engine)
         self._worker_started = False
 
+    def close(self) -> None:
+        """Release resources (the underlying DB connection). Safe to call twice."""
+        self.store.close()
+
     # ── Scan Lifecycle ─────────────────────────────────────────────────────
 
     def create_scan(

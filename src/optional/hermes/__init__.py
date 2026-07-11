@@ -7,13 +7,13 @@ retrying transient failures, and emitting events for dashboard/API consumers.
 
 Quick start::
 
-    from src.orchestrator import create_api
+    from src.optional.hermes import create_api
 
     api = create_api("data/hermes.db")
     scan = api.create_scan(
-        project_id="wickedgud",
-        target_url="https://wickedgud.com",
-        queries=["healthy alternatives for fitness freaks"],
+        project_id="example",
+        target_url="https://example.com",
+        queries=["your query here"],  # queries are always caller-supplied
     )
     api.start_worker()  # background asyncio loop
     # ... let it run ...
