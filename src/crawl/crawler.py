@@ -143,9 +143,14 @@ async def _crawl_page(
         return CrawlResult(url=url, title="", content="", html="", success=False, error=str(exc))
 
 
-async def crawl_site(start_url: str) -> list[CrawlResult]:
+async def crawl_site(start_url: str,
+                     seed_urls: list[str] | None = None) -> list[CrawlResult]:
     """
     Crawl a site starting from start_url.
+
+    seed_urls (Layer 0 sitemap-first seeding): same-domain URLs queued at
+    depth 1 right after the root, so sitemap pages are captured even when BFS
+    link-following would never reach them.
 
     Depth + page capping handled in Python loop.
     Uses Playwright (chromium) for JS-rendered sites.
@@ -181,6 +186,13 @@ async def crawl_site(start_url: str) -> list[CrawlResult]:
     all_results: list[CrawlResult] = []
     visited: set[str] = set()
     queue: list[tuple[str, int]] = [(normalize_url(start_url), 0)]
+    if seed_urls:
+        from urllib.parse import urlparse
+        host = urlparse(start_url).netloc
+        seeded = [normalize_url(u) for u in seed_urls
+                  if urlparse(u).netloc == host]
+        queue += [(u, 1) for u in dict.fromkeys(seeded)]
+        logger.info(f"Sitemap-first seeding: {len(seeded)} URLs queued")
 
     async with AsyncWebCrawler(config=browser_cfg) as crawler:
         while queue and len(all_results) < max_pages:
@@ -214,14 +226,15 @@ async def crawl_site(start_url: str) -> list[CrawlResult]:
     return all_results
 
 
-def crawl_site_sync(start_url: str) -> list[CrawlResult]:
+def crawl_site_sync(start_url: str,
+                    seed_urls: list[str] | None = None) -> list[CrawlResult]:
     """Synchronous wrapper — handles nested event loops."""
     import concurrent.futures
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(crawl_site(start_url))
+        return asyncio.run(crawl_site(start_url, seed_urls))
     else:
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(asyncio.run, crawl_site(start_url))
+            future = pool.submit(asyncio.run, crawl_site(start_url, seed_urls))
             return future.result()
