@@ -92,14 +92,23 @@ def build_index(url: str, max_pages: int | None, fresh: bool,
         from src.core import config as _cfg
         _cfg.CFG.setdefault("crawl", {})["max_pages"] = max_pages
 
+    from src.layer0 import run_layer0, fetch_sitemap
+
     site_trace = Trace(query="__site_index__")
 
-    logger.info(f"[index] crawling {url}")
-    crawl_results = crawl_site_sync(url)
+    # LAYER 0: sitemap-FIRST seeding — sitemap URLs join the crawl queue
+    sitemap = fetch_sitemap(url)
+    logger.info(f"[index] crawling {url} "
+                f"(sitemap seeded: {len(sitemap)} URLs)")
+    crawl_results = crawl_site_sync(url, seed_urls=[s["url"] for s in sitemap])
     ok = [r for r in crawl_results if getattr(r, "success", False)]
     if not ok:
         raise RuntimeError(f"No pages could be crawled from {url}")
     logger.info(f"[index] {len(ok)}/{len(crawl_results)} pages crawled")
+
+    # LAYER 0 enrichment: JSON-LD/headings/links, 4-bot re-fetch ->
+    # access_gaps, robots cross-check, PDFs
+    l0 = run_layer0(url, crawl_results, trace=site_trace, sitemap=sitemap)
 
     chunk_objs = chunk_pages(crawl_results)
     chunks = [{"content": c.content, "chunk_id": c.chunk_id, "url": c.url}
@@ -132,16 +141,17 @@ def build_index(url: str, max_pages: int | None, fresh: bool,
     # step 7 — topics
     topics = cluster_topics(chunks, trace=site_trace)
 
-    # steps 11-14 — heuristic signals (formulas logged, labeled heuristic)
+    # steps 11-14 — heuristic signals, now fed real Layer-0 enrichment
+    # (JSON-LD presence, anchored internal links)
     inbound: dict[str, int] = {}
-    for r in ok:
-        for dest in getattr(r, "internal_links", []) or []:
-            inbound[dest] = inbound.get(dest, 0) + 1
-    pages = [{"url": r.url, "title": r.title, "content": r.content,
-              "internal_inbound": inbound.get(r.url, 0),
-              "internal_links": [{"anchor_text": "", "dest_url": d}
-                                 for d in (getattr(r, "internal_links", []) or [])]}
-             for r in ok]
+    for p in l0["pages"]:
+        for link in p["internal_links"]:
+            inbound[link["dest_url"]] = inbound.get(link["dest_url"], 0) + 1
+    pages = [{"url": p["url"], "title": p["title"], "content": p["content"],
+              "schema_jsonld": p["schema_jsonld"],
+              "internal_inbound": inbound.get(p["url"], 0),
+              "internal_links": p["internal_links"]}
+             for p in l0["pages"]]
     page_signals = score_pages(pages)
 
     # step 8 (+9) — knowledge graph with embeddings on Chunk nodes
@@ -162,9 +172,12 @@ def build_index(url: str, max_pages: int | None, fresh: bool,
             "n_claims": len(claims), "n_topics": len(topics),
             "ner_crosscheck_mean_disagreement": xcheck["mean_disagreement"],
             "kg": kg_stats,
+            "sitemap": l0["sitemap_stats"], "n_pdfs": len(l0["pdfs"]),
+            "robots_conflicts": sum(len(p["robots_conflict"]) for p in l0["pages"]),
         },
         "chunks": chunks, "embeddings": embeddings, "kg": kg,
         "page_signals": page_signals, "site_trace": site_trace,
+        "l0_pages": l0["pages"],
     }
 
 
@@ -173,6 +186,7 @@ def write_reports(ctx: dict, traces: list[Trace], explanations: list[dict],
     from src.explain import render_markdown
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
+        "invisibility": ctx.get("invisibility"),   # headline metric, measured
         "site": ctx["site_report"],
         "provider": providers.provider_info(),
         "site_trace": ctx["site_trace"].to_dict(),
@@ -184,7 +198,19 @@ def write_reports(ctx: dict, traces: list[Trace], explanations: list[dict],
                          encoding="utf-8")
 
     sr = ctx["site_report"]
-    lines = [f"# AI-Search Readiness Audit — {sr['url']}", "",
+    inv = ctx.get("invisibility") or {}
+    lines = [f"# AI-Search Readiness Audit — {sr['url']}", ""]
+    if inv:
+        lines += [f"## {inv['headline']}",
+                  f"(AI Invisibility Score: {inv['site_invisibility']:.0%} — "
+                  f"{inv['label']}; weighting: {inv['weighting']})", ""]
+        for wp in inv["worst_pages"][:3]:
+            if wp["mean_invisible_ratio"] > 0:
+                lines.append(f"- {wp['url']}: {wp['mean_invisible_ratio']:.0%} invisible"
+                             f" — e.g. missing: "
+                             f"{(wp['worst_missing_blocks'] or ['—'])[0][:90]!r}")
+        lines.append("")
+    lines += [
              f"- Pages: {sr['pages_crawled']}/{sr['pages_total']}  "
              f"Chunks: {sr['chunks']}  Embed dim: {sr['embed_dim']}",
              f"- Entities: {sr['n_entities']}  Relations: {sr['n_relationships']}  "
@@ -207,6 +233,8 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
     from src.simulator import run_query
     from src.explain import explain_query
 
+    from src.layer0 import invisibility_score
+
     ctx = build_index(url, max_pages, fresh, claims_cap)
     traces, explanations = [], []
     for q in queries:
@@ -214,6 +242,10 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
                       page_signals=ctx["page_signals"])
         traces.append(t)
         explanations.append(explain_query(t, kg=ctx["kg"]))
+    # AI Invisibility Score (measured) — weighted by PageRank and by the pages
+    # that actually won retrievals for this query set
+    winner_urls = {c["page_url"] for t in traces for c in t.citations if c["page_url"]}
+    ctx["invisibility"] = invisibility_score(ctx["l0_pages"], winner_urls)
     json_path = write_reports(ctx, traces, explanations, out_dir)
     logger.info(f"[report] wrote {json_path}")
     return {"site_report": ctx["site_report"], "traces": traces,

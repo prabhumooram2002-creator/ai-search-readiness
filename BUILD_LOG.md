@@ -603,3 +603,42 @@ Layer 3 output includes: dropped-with-reason (NLI high-confidence neutral),
 4 retrieval dead ends per query (real content gaps on example.com), and
 rule-engine recommendations (weak_evidence, retrieval_dead_end).
 Suite after everything: **48 passed, 1 skipped**.
+
+---
+
+## PHASE 1 (v3 brief) — Layer 0 completion + AI Invisibility Score (2026-07-12)
+
+**Built (`src/layer0.py` + crawler seeding + run_audit wiring):**
+- Sitemap-first seeding: fetch_sitemap (nested indexes, lastmod) -> URLs seeded
+  into the crawl queue (crawl_site gained `seed_urls`).
+- Per-page enrichment: JSON-LD, headings w/ level, internal/external links w/
+  anchor text, linked-PDF extraction (pymupdf, text+tables).
+- 4-bot UA re-fetch (GPTBot/ClaudeBot/PerplexityBot/Google-Extended, plain
+  HTTP = no JS, like the real bots) -> access_gaps[{bot, missing_content[]}]
+  per page, present even when empty.
+- robots.txt declared-vs-actual cross-check -> robots_conflict
+  (fetchable_despite_disallow / blocked_despite_allow).
+- AI Invisibility Score (labeled MEASURED): per page chars(missing)/chars(
+  rendered) per bot; site level weighted by internal PageRank x2 for
+  retrieval-winning pages; headline + top-10 worst pages lead every report.
+
+**Failures found and fixed during live verification (both pasted in session):**
+1. False 100% invisibility on a fully static page — crawl4ai markdown flattens
+   link HREFS into text; hrefs are attributes, never in bot-visible text.
+   Fixed: URLs stripped from rendered blocks + 4-word shingle containment
+   (>=50%) instead of brittle whole-block substring. Regression test added.
+2. Sitemap capture 3.6% — seeding was missing (only measured). Implemented
+   sitemap-first queue seeding; capture went to 100%.
+
+**Live verification (quotes.toscrape.com/js vs static, sitemaps.org):**
+```
+JS site   : invisibility 1.00 (all 4 bots), 13 missing blocks = the quotes;
+            5/5 sampled blocks CONFIRMED absent from raw GPTBot HTML
+Static twin: invisibility 0.00 (all 4 bots)
+Sitemap    : 84 URLs seeded -> 84/84 captured (100% >= 95%), lastmod 84/84
+access_gaps present for all 4 bots on every page (incl. 90-page crawl)  PASS
+```
+
+**Tests:** tests/test_layer0.py 8 passed (sitemap parse+nesting, enrichment,
+JS-diff, 4-bot coverage, robots conflicts, weighting+label, PDF roundtrip,
+href regression). Full suite: 56 passed, 1 skipped.
