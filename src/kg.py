@@ -258,6 +258,15 @@ class KnowledgeGraph:
             "claims_without_support": no_support,
         }
 
+    # ── surgical update (Phase 2 incremental — NO full rebuild) ─────────────
+    def delete_chunk_data(self, chunk_id: str) -> None:
+        """Remove one chunk and everything that traces to it: its
+        MentionsEntity/SupportsClaim/BelongsToTopic/HasChunk edges, the Claims
+        sourced from it, and the Chunk node itself."""
+        self._exec("MATCH (cl:Claim) WHERE cl.source_chunk_id = $id "
+                   "DETACH DELETE cl", {"id": chunk_id})
+        self._exec("MATCH (c:Chunk {id: $id}) DETACH DELETE c", {"id": chunk_id})
+
     # ── traversal used by Layer 2 ───────────────────────────────────────────
     def two_hop_entities(self, entity_ids: list[str]) -> list[dict]:
         """RelatesTo/MentionsEntity 2-hop neighborhood -> supporting chunks."""

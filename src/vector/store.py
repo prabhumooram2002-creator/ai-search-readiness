@@ -88,6 +88,12 @@ class VectorStore:
         else:
             logger.info("All chunks already in vector store — skipping")
     
+    def delete_ids(self, chunk_ids: list[str]) -> None:
+        """Surgical delete (Phase 2 incremental): remove specific chunk vectors."""
+        if chunk_ids:
+            self.collection.delete(ids=chunk_ids)
+            logger.info(f"Vector store: deleted {len(chunk_ids)} chunk vectors")
+
     def search(self, query_embedding: list[float], top_k: int = None) -> list[SearchResult]:
         """Vector similarity search — returns top_k closest chunks."""
         cfg = vector()
