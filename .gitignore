@@ -47,3 +47,12 @@ generate_*.py
 *.out2.txt
 *.out3.txt
 logs/
+
+# Keep the real entrypoint and the tests/ package (the broad rules above are for
+# root-level one-off scratch scripts only)
+!run_audit.py
+!tests/
+!tests/**/*.py
+
+# Claude Code local (per-user) settings
+.claude/settings.local.json

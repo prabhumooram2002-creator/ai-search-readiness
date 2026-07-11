@@ -142,34 +142,22 @@ async def chat_complete(
             logger.debug(f"Chat cache hit: {cache_key[:8]}...")
             return cached["response"]
 
-    last_error = None
-    for provider in provider_priority:
-        if provider == "nvidia" and NVIDIA_API_KEY:
-            try:
-                response = await _nvidia_chat(
-                    messages, model=nvidia_model,
-                    max_tokens=max_tokens, temperature=temperature,
-                )
-                with open(cache_path, "w") as f:
-                    json.dump({"response": response}, f)
-                return response
-            except Exception as e:
-                logger.warning(f"NVIDIA chat failed: {e}")
-                last_error = e
-                continue
+    # Route through the provider abstraction: local ollama by default, deepseek
+    # only if LLM_PROVIDER selects it. No NVIDIA/DeepSeek key required by default.
+    import asyncio
+    from .. import providers
 
-        elif provider == "deepseek" and DEEPSEEK_API_KEY:
-            try:
-                response = await _deepseek_chat(
-                    messages, model=deepseek_model,
-                    max_tokens=max_tokens, temperature=temperature,
-                )
-                with open(cache_path, "w") as f:
-                    json.dump({"response": response}, f)
-                return response
-            except Exception as e:
-                logger.warning(f"DeepSeek chat failed: {e}")
-                last_error = e
-                continue
+    system_for_provider = "\n\n".join(
+        m["content"] for m in messages if m["role"] == "system"
+    ) or None
 
-    raise RuntimeError(f"All chat providers failed. Last error: {last_error}")
+    response = await asyncio.to_thread(
+        providers.llm_complete,
+        prompt,
+        system=system_for_provider,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    with open(cache_path, "w") as f:
+        json.dump({"response": response}, f)
+    return response

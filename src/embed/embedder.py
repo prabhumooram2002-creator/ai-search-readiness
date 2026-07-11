@@ -23,8 +23,16 @@ DEEPSEEK_EMBED_URL = "https://api.deepseek.com/v1/embeddings"
 GOOGLE_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # ─── Cache ────────────────────────────────────────────────────────────────────
+def _embed_tag() -> str:
+    """Model-aware cache namespace so local (1024-dim) and nvidia (other dim)
+    embeddings never collide in the on-disk cache."""
+    from .. import providers
+    if providers._resolve_embed_provider() == "local":
+        return providers.EMBED_MODEL.replace("/", "_")
+    return "nvidia"
+
 def _cache_path(content_hash: str) -> str:
-    return str(CACHE_DIR / f"{content_hash}.json")
+    return str(CACHE_DIR / f"{_embed_tag()}__{content_hash}.json")
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:32]
@@ -192,7 +200,12 @@ async def embed_chunks(chunk_texts: list[str], use_cache: bool = True) -> list[l
 
     # ── Phase 2: batch all uncached into API calls via asyncio.gather ──────
     async def call_provider(texts: list[str]) -> list[list[float]]:
-        """Call all providers in priority order, return embeddings."""
+        """Route to the configured embed provider. Local BGE-M3 is the default
+        (no API key); nvidia/deepseek/google only when EMBED_PROVIDER selects them."""
+        from .. import providers
+        if providers._resolve_embed_provider() == "local":
+            # CPU-bound sentence-transformers call — run off the event loop.
+            return await asyncio.to_thread(providers.embed_texts, texts)
         last_exc = None
         for provider in provider_priority:
             try:
