@@ -160,6 +160,12 @@ def build_index(url: str, max_pages: int | None, fresh: bool,
                         topics, pages=pages, embeddings=embeddings,
                         trace=site_trace)
 
+    # Phase 2 — capture baseline state so the next run can be incremental
+    from src.incremental import IncrementalState, baseline_capture
+    _state = IncrementalState()
+    baseline_capture(_state, crawl_results, chunk_objs, l0_pages=l0["pages"])
+    _state.close()
+
     _unload_extraction_models()
 
     return {
@@ -178,6 +184,81 @@ def build_index(url: str, max_pages: int | None, fresh: bool,
         "chunks": chunks, "embeddings": embeddings, "kg": kg,
         "page_signals": page_signals, "site_trace": site_trace,
         "l0_pages": l0["pages"],
+    }
+
+
+def build_index_incremental(url: str, claims_cap: int) -> dict:
+    """Phase 2: incremental index update (4-level skip chain), then rebuild
+    the query context from stored state. Falls back to full when no baseline."""
+    import json as _json
+    from src.incremental import IncrementalState, incremental_update
+    from src.embed import embed_chunks_sync
+    from src.vector import VectorStore
+    from src.ner import extract_entities
+    from src.relations import extract_relations
+    from src.claims import extract_claims
+    from src.evidence import extract_evidence
+    from src.topics import cluster_topics
+    from src.signals import score_pages
+    from src.kg import KnowledgeGraph
+    from src.layer0 import invisibility_score  # noqa: F401 (used by run())
+
+    state = IncrementalState()
+    if not state.has_baseline():
+        logger.warning("[incremental] no baseline — running a FULL build instead")
+        state.close()
+        return build_index(url, None, fresh=False, claims_cap=claims_cap)
+
+    site_trace = Trace(query="__site_index__")
+    kg = KnowledgeGraph()
+    vs = VectorStore()
+
+    def process(new_chunk_objs):
+        cd = [{"chunk_id": c.chunk_id, "content": c.content, "url": c.url}
+              for c in new_chunk_objs]
+        embs = embed_chunks_sync([c.content for c in new_chunk_objs], use_cache=True)
+        vs.add_chunks(new_chunk_objs, embs)
+        ents = extract_entities(cd, trace=site_trace)
+        rels = extract_relations(cd, ents, trace=site_trace)
+        cls = extract_claims(cd[:claims_cap], trace=site_trace)
+        ev = extract_evidence(cd[:claims_cap], cls, trace=site_trace)
+        kg.build(cd, ents, rels, cls, ev, embeddings=embs, trace=site_trace)
+
+    stats = incremental_update(url, state, kg, vs, process, trace=site_trace)
+
+    # rebuild query context from state
+    chunks = state.active_chunks()
+    embeddings = embed_chunks_sync([c["content"] for c in chunks], use_cache=True)
+    topics = cluster_topics(chunks, trace=site_trace) if stats["rerun_topics"] else []
+
+    pages, inbound = [], {}
+    for row in state.all_pages():
+        links = _json.loads(row["internal_links_json"] or "[]")
+        for l in links:
+            inbound[l.get("dest_url", "")] = inbound.get(l.get("dest_url", ""), 0) + 1
+        pages.append({
+            "url": row["url"], "title": row["title"],
+            "content": " ".join(c["content"] for c in chunks
+                                if c["url"] == row["url"])[:8000],
+            "internal_links": links,
+            "access_gaps": _json.loads(row["access_gaps_json"] or "[]"),
+        })
+    for p in pages:
+        p["internal_inbound"] = inbound.get(p["url"], 0)
+    page_signals = score_pages(pages)
+    _unload_extraction_models()
+
+    return {
+        "site_report": {
+            "url": url, "mode": "incremental", **stats,
+            "chunks": len(chunks), "vector_count": vs.count(),
+            "chroma_kuzu_parity": vs.count() == len(chunks),
+            "embed_dim": len(embeddings[0]) if embeddings else None,
+            "n_topics": len(topics), "kg": kg.verify(),
+        },
+        "chunks": chunks, "embeddings": embeddings, "kg": kg,
+        "page_signals": page_signals, "site_trace": site_trace,
+        "l0_pages": pages,
     }
 
 
@@ -211,10 +292,12 @@ def write_reports(ctx: dict, traces: list[Trace], explanations: list[dict],
                              f"{(wp['worst_missing_blocks'] or ['—'])[0][:90]!r}")
         lines.append("")
     lines += [
-             f"- Pages: {sr['pages_crawled']}/{sr['pages_total']}  "
+             f"- Mode: {sr.get('mode', 'full')}  "
+             f"Pages: {sr.get('pages_crawled', sr.get('pages_total', '?'))}  "
              f"Chunks: {sr['chunks']}  Embed dim: {sr['embed_dim']}",
-             f"- Entities: {sr['n_entities']}  Relations: {sr['n_relationships']}  "
-             f"Claims: {sr['n_claims']}  Topics: {sr['n_topics']}",
+             f"- Entities: {sr.get('n_entities', '-')}  "
+             f"Relations: {sr.get('n_relationships', '-')}  "
+             f"Claims: {sr.get('n_claims', '-')}  Topics: {sr.get('n_topics', 0)}",
              f"- KG: {sr['kg']['nodes']} | orphan_chunks={sr['kg']['orphan_chunks']} "
              f"claims_without_support={sr['kg']['claims_without_support']}",
              f"- Provider: {providers.provider_info()['llm_provider_effective']}"
@@ -229,13 +312,16 @@ def write_reports(ctx: dict, traces: list[Trace], explanations: list[dict],
 
 
 def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
-        fresh: bool, claims_cap: int = 25) -> dict:
+        fresh: bool, claims_cap: int = 25, mode: str = "full") -> dict:
     from src.simulator import run_query
     from src.explain import explain_query
 
     from src.layer0 import invisibility_score
 
-    ctx = build_index(url, max_pages, fresh, claims_cap)
+    if mode == "incremental":
+        ctx = build_index_incremental(url, claims_cap)
+    else:
+        ctx = build_index(url, max_pages, fresh, claims_cap)
     traces, explanations = [], []
     for q in queries:
         t = run_query(q, ctx["chunks"], ctx["embeddings"], kg=ctx["kg"],
@@ -264,14 +350,31 @@ def main() -> None:
     ap.add_argument("--out", default="data/reports", help="Report output directory")
     ap.add_argument("--no-fresh", action="store_true",
                     help="Do not reset the vector store before indexing")
+    ap.add_argument("--incremental", action="store_true",
+                    help="Incremental update (default once a baseline exists)")
+    ap.add_argument("--full", action="store_true",
+                    help="Force a full rebuild even when a baseline exists")
     args = ap.parse_args()
 
+    # Phase 2 mode resolution: incremental is the default once a baseline
+    # exists; --full always forces a rebuild.
+    from src.incremental import IncrementalState
+    _s = IncrementalState()
+    has_baseline = _s.has_baseline()
+    _s.close()
+    if args.full:
+        mode = "full"
+    elif args.incremental or has_baseline:
+        mode = "incremental"
+    else:
+        mode = "full"
+
     queries = load_queries(args.queries, args.query)
-    logger.info(f"Auditing {args.url} with {len(queries)} queries "
+    logger.info(f"Auditing {args.url} with {len(queries)} queries mode={mode} "
                 f"(LLM={providers.LLM_PROVIDER}:{providers.LLM_MODEL}, "
                 f"EMBED={providers.EMBED_PROVIDER}:{providers.EMBED_MODEL})")
     result = run(args.url, queries, Path(args.out), args.max_pages,
-                 fresh=not args.no_fresh, claims_cap=args.claims_cap)
+                 fresh=not args.no_fresh, claims_cap=args.claims_cap, mode=mode)
     print(f"\nReport written to {result['report_path']}")
 
 

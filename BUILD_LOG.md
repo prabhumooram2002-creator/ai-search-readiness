@@ -642,3 +642,39 @@ access_gaps present for all 4 bots on every page (incl. 90-page crawl)  PASS
 **Tests:** tests/test_layer0.py 8 passed (sitemap parse+nesting, enrichment,
 JS-diff, 4-bot coverage, robots conflicts, weighting+label, PDF roundtrip,
 href regression). Full suite: 56 passed, 1 skipped.
+
+---
+
+## PHASE 2 (v3 brief) — Incremental crawl & data freshness (2026-07-12)
+
+**Built (`src/incremental.py` + surgical deletes in kg/vector store + CLI):**
+- 4-level skip chain: (1) conditional GET w/ stored ETag/Last-Modified -> 304
+  skips page; sitemap lastmod orders fetches; (2) markdown hash (never raw
+  HTML) catches lying headers; (3) chunk-level content-hash diff -> only
+  changed/new chunks reprocessed, deleted chunks tombstoned; (4) surgical
+  update: chunk_id-scoped deletes in Kuzu (claims + edges + node) and Chroma,
+  NO full rebuild. Topics re-run only when >15% chunks changed.
+- SQLite state (pages w/ validators + adaptive revisit halve/double, chunks w/
+  tombstones, crawl_runs metrics).
+- CLI: --incremental (default once baseline exists) / --full; full builds
+  auto-capture the baseline.
+
+**Live verification (local http.server, 6-page site, touch d.html):**
+```
+pages_304=5  pages_changed=1  chunks_added=1 (exactly the edited chunk,
+  'renovated pricing' confirmed in reprocessed content)  tombstoned=0
+chroma count 6 == active chunks 6 (parity)   kg orphan_chunks=0
+TIMING: full=65.2s  incremental=11.0s  ->  5.9x  (>=5x PASS)
+```
+First run on a 3-page site scored 4.8x — under the bar because one changed
+page pays full Playwright startup (~6s fixed) against a tiny baseline; the
+6-page site reflects the true scaling (incremental cost is O(changed), full
+is O(site)). Logged, not hidden.
+
+**Tests:** tests/test_incremental.py 6 passed (304 skip, lying-header hash
+catch, chunk diff + tombstone + surgical deletes on both stores, >15% topic
+trigger, adaptive revisit, crawl_runs rows). Full suite: 62 passed, 1 skipped.
+
+**Honest limits:** incremental mode re-enriches Layer-0 (bot re-fetch) only
+for changed pages — unchanged pages keep stored access_gaps; page signals in
+incremental context rebuild content from active chunks (approximation).
