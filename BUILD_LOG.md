@@ -820,3 +820,30 @@ passed, 1 skipped.
    query's predicted coverage 0.5 -> 1.0 (delta +0.5, +1 sub-intent).
    Draft structure flags surface (paragraph_too_long, numeric-series-as-table).
 Offline suite: 98 passed, 1 skipped.
+
+## PHASE 8 (v3 brief) — Fix generation: patches, not advice (2026-07-12)
+
+**Built (`src/fixes.py` + `run_audit.py --fixes`):**
+- generate_jsonld: FAQPage (2+ question headings) else Article; validate_jsonld
+  checks @context=schema.org, @type, type-required props, FAQ Q/A shape,
+  JSON-serializability BEFORE emit.
+- generate_llms_txt: from real pages (http only) + topics, pagerank-ordered,
+  draft banner.
+- generate_faq: local LLM drafts Q/A grounded ONLY in supplied source claims
+  ([TODO: confirm] when facts missing).
+- rewrite_block: local LLM restructures flagged blocks (numeric prose -> table,
+  long paragraph -> split), facts preserved.
+- generate_fixes: writes fixes/run_NNNN/*.{jsonld,md,txt} + manifest.json
+  mapping each artifact to a finding id; every draft carries
+  "draft — human review required, never auto-publish". `--fixes` wires it into
+  the audit; fixes/ gitignored.
+
+**Verification (test_fixes.py 5 passed + live cloud run):**
+- JSON-LD validates (Article + FAQPage); validator rejects bad @context /
+  missing required props.
+- llms.txt lists ONLY real http URLs (javascript:/relative dropped).
+- manifest maps every fix file to a finding id (schema:/site:/deadend:/
+  structure:<chunk_id>); banner present on all drafts.
+- LIVE (gpt-oss:120b-cloud): FAQ grounded in the given claim ("30-day
+  money-back guarantee"); numeric prose rewritten into a real markdown table.
+Offline suite: 103 passed, 1 skipped.

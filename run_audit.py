@@ -312,7 +312,8 @@ def write_reports(ctx: dict, traces: list[Trace], explanations: list[dict],
 
 
 def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
-        fresh: bool, claims_cap: int = 25, mode: str = "full") -> dict:
+        fresh: bool, claims_cap: int = 25, mode: str = "full",
+        emit_fixes: bool = False) -> dict:
     from src.simulator import run_query
     from src.explain import explain_query
 
@@ -344,7 +345,28 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
         pages_with_schema=pages_with_schema)
     snap = build_snapshot(url, ctx["invisibility"], struct,
                           ctx["page_signals"], traces)
-    ctx["snapshot_run_id"] = save_snapshot(snap)
+    run_id = save_snapshot(snap)
+    ctx["snapshot_run_id"] = run_id
+
+    # Phase 8 — emit ready-to-use fix artifacts (draft, human-review) if asked
+    if emit_fixes:
+        from src.fixes import generate_fixes
+        pages_no_schema = [p for p in ctx["l0_pages"] if not p.get("schema_jsonld")]
+        dead_ends = [{"sub_query": de.get("sub_query", de) if isinstance(de, dict) else de}
+                     for t in traces for de in t.retrieval_dead_ends][:5]
+        flagged = [{"chunk_id": s["chunk_id"],
+                    "text": next((c["content"] for c in ctx["chunks"]
+                                  if c["chunk_id"] == s["chunk_id"]), ""),
+                    "flags": s["flags"]} for s in struct if s["flags"]][:5]
+        site = {"name": url, "description": "",
+                "pages": [{"url": p["url"], "title": p.get("title", ""),
+                           "pagerank": 0} for p in ctx["l0_pages"]],
+                "topics": []}
+        fx = generate_fixes(run_id, pages_without_schema=pages_no_schema[:5],
+                            site=site, dead_ends=dead_ends, structure_flagged=flagged,
+                            trace=ctx["site_trace"])
+        ctx["fixes_dir"] = fx["run_dir"]
+        logger.info(f"[fixes] {len(fx['manifest'])} artifacts -> {fx['run_dir']}")
 
     json_path = write_reports(ctx, traces, explanations, out_dir)
     logger.info(f"[report] wrote {json_path}")
@@ -497,6 +519,8 @@ def main() -> None:
                     help="Incremental update (default once a baseline exists)")
     ap.add_argument("--full", action="store_true",
                     help="Force a full rebuild even when a baseline exists")
+    ap.add_argument("--fixes", action="store_true",
+                    help="Emit ready-to-use fix artifacts (draft) to fixes/<run>/")
     args = ap.parse_args()
 
     # Phase 2 mode resolution: incremental is the default once a baseline
@@ -517,7 +541,8 @@ def main() -> None:
                 f"(LLM={providers.LLM_PROVIDER}:{providers.LLM_MODEL}, "
                 f"EMBED={providers.EMBED_PROVIDER}:{providers.EMBED_MODEL})")
     result = run(args.url, queries, Path(args.out), args.max_pages,
-                 fresh=not args.no_fresh, claims_cap=args.claims_cap, mode=mode)
+                 fresh=not args.no_fresh, claims_cap=args.claims_cap, mode=mode,
+                 emit_fixes=args.fixes)
     print(f"\nReport written to {result['report_path']}")
 
 
