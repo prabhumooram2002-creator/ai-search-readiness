@@ -7,11 +7,20 @@ engine runs were logged — never estimated here).
 """
 from __future__ import annotations
 
+import re
+
 from .core.logging import get_logger
 
 logger = get_logger(__name__)
 
 WEAK_EVIDENCE_FLOOR = 0.5
+
+
+def _slug(text: str) -> str:
+    """Same scheme as src/fixes.py's _slug — kept in lockstep so Phase 10's
+    impact chain (src/impact.py) can join a recommendation to its Phase 8
+    fix artifact by finding_id without duplicating slug logic in two places."""
+    return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")[:40] or "fix"
 
 
 def _step(trace, name):
@@ -102,25 +111,28 @@ def explain_query(trace, kg=None) -> dict:
     # Recommendations — rule engine per failure pattern, with exact locations
     recs = []
     for name in missing_entities:
-        recs.append({"rule": "missing_entity",
+        recs.append({"rule": "missing_entity", "finding_id": f"entity:{_slug(name)}",
                      "action": f'Add a section covering "{name}" — no Entity '
                                f'node exists for it in the site graph.'})
     for w in weak:
         recs.append({"rule": "weak_evidence", "chunk_id": w["chunk_id"],
+                     "finding_id": f"structure:{w['chunk_id']}",
                      "action": "Add supporting data/citations near this chunk "
                                f"(NLI {w['nli_label']} {w['nli_conf']})."})
     for de in trace.retrieval_dead_ends:
         sub = de["sub_query"] if isinstance(de, dict) else de
         w = f" (fan-out weight {de['weight']})" if isinstance(de, dict) else ""
-        recs.append({"rule": "retrieval_dead_end",
+        recs.append({"rule": "retrieval_dead_end", "finding_id": f"deadend:{_slug(sub)}",
                      "action": f'Real content gap: no chunk answers "{sub}"{w} '
                                f"above the score floor. Create content for it."})
     for s in trace.unsupported_sentences:
         recs.append({"rule": "unsupported_answer_sentence",
+                     "finding_id": f"unsupported:{_slug(s[:40])}",
                      "action": f'Answer sentence "{s[:80]}..." has no source '
                                "support — strengthen or remove the claim on-site."})
     for b in bottlenecks:
         recs.append({"rule": "trust_bottleneck", "chunk_id": b["chunk_id"],
+                     "finding_id": f"structure:{b['chunk_id']}",
                      "action": "Add author credentials / earn citations for "
                                "this winning-but-low-authority page."})
     rows["recommendations"] = recs
