@@ -76,6 +76,12 @@ async def _nvidia_embed_with_retry(texts: list[str], model: str = "nvidia/nv-emb
                 "model": model,
                 "encoding_format": "float",
             }
+            # Asymmetric NIM embedding models (e.g. nv-embedqa-*) require
+            # input_type ("query" or "passage") or the API 400s. Every call
+            # site in this codebase embeds document/chunk content, not user
+            # queries, so "passage" is correct here.
+            if "embedqa" in model:
+                payload["input_type"] = "passage"
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(NVIDIA_EMBED_URL, headers=headers, json=payload)
