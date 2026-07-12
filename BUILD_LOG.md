@@ -779,3 +779,23 @@ LIVE re-verify (cloud gpt-oss:120b): r1=18, r2=22 sub-intents;
   string Jaccard=0.00 (wording varies) but SEMANTIC top-5 stability=0.80
   (>=0.6 PASS). Both rounds share: exception types, custom exceptions,
   try/except structure, specific-vs-broad catch. Offline suite: 90 passed.
+
+## PHASE 6 (v3 brief) — Manual calibration panel (2026-07-12)
+
+**Built (`src/calibration.py` + `run_audit.py calibrate`):**
+- generate_templates: writes calibration/run_NNNN/qNNN.md paste-templates for
+  the top-20 weighted queries (ChatGPT / Perplexity / Gemini sections).
+- parse_calibration_file: extracts each engine's answer + cited URLs -> domains.
+- compute_agreement: per-engine + overall agreement = did the simulator's
+  winning pages' domains appear in the engine's real citations? Stored as
+  citation_probability_observed, LABELED "observed", never merged with the
+  simulated confidence (v2 rule holds). <50% overall -> tuning note.
+- CLI: `calibrate --template` (write blanks) / `calibrate --run N` (score).
+- calibration/ gitignored (user paste data).
+
+**Verification (test_calibration.py, 5 passed):** parses a filled 3-engine
+file; agreement hand-checked — simulator cited hubspot.com, ChatGPT cited it
+(1.0), Perplexity didn't (0.0), Gemini blank -> skipped, overall 0.5; below-
+floor case emits the retriever-tuning note; observed dict carries label
+"observed" and NO simulated/confidence keys (never merged). Offline suite: 95
+passed, 1 skipped.

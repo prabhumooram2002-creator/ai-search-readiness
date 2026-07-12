@@ -56,3 +56,6 @@ logs/
 
 # Claude Code local (per-user) settings
 .claude/settings.local.json
+
+# Phase 6 manual calibration paste data (per-run, user-provided)
+calibration/

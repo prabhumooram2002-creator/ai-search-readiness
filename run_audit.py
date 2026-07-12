@@ -392,6 +392,46 @@ def cmd_diff(argv: list[str]) -> int:
     return 1 if d["ci_status"] == "fail" else 0
 
 
+def cmd_calibrate(argv: list[str]) -> int:
+    """`run_audit.py calibrate --run N [--template]` — compare the simulator's
+    winning pages against real ChatGPT/Perplexity/Gemini citations (manual
+    panel). Observed numbers are reported separately from simulated."""
+    from src.calibration import (generate_templates, load_run, compute_agreement)
+    from src.snapshots import list_snapshots, load_snapshot
+    ap = argparse.ArgumentParser(prog="run_audit.py calibrate")
+    ap.add_argument("--run", type=int, help="snapshot run id (default: latest)")
+    ap.add_argument("--template", action="store_true",
+                    help="write blank paste-templates for the top-20 queries")
+    args = ap.parse_args(argv)
+    runs = list_snapshots()
+    if not runs:
+        print("No snapshots yet — run an audit first.")
+        return 2
+    run_id = args.run or runs[-1]
+    snap = load_snapshot(run_id)
+    if args.template:
+        qs = [{"query": q, "weight": v.get("weight", 0)}
+              for q, v in snap["queries"].items()]
+        root = generate_templates(run_id, qs)
+        print(f"Wrote calibration templates -> {root}\n"
+              f"Fill each engine's answer + cited URLs, then run "
+              f"`run_audit.py calibrate --run {run_id}`.")
+        return 0
+    calibration = load_run(run_id)
+    if not calibration:
+        print(f"No filled calibration files for run {run_id}. "
+              f"Run with --template first.")
+        return 2
+    wins = {q: v.get("winning_pages", []) for q, v in snap["queries"].items()}
+    ag = compute_agreement(calibration, wins)
+    print(f"OBSERVED citation agreement (run {run_id}) — reported separately "
+          f"from simulated confidence:")
+    print(f"  overall: {ag['overall_agreement']}  per-engine: "
+          f"{ag['per_engine_agreement']}")
+    print(f"  {ag['note']}")
+    return 0
+
+
 def main() -> None:
     # Lightweight subcommand dispatch (keeps `run_audit.py --url ...` working;
     # Phase 4+ add import-queries / diff / whatif / calibrate / import-logs).
@@ -400,6 +440,8 @@ def main() -> None:
         return
     if len(sys.argv) > 1 and sys.argv[1] == "diff":
         raise SystemExit(cmd_diff(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "calibrate":
+        raise SystemExit(cmd_calibrate(sys.argv[2:]))
 
     ap = argparse.ArgumentParser(
         description="Traced, local-first AI-search readiness audit (Layers 1-3).")
