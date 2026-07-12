@@ -65,6 +65,14 @@ async def _nvidia_embed_with_retry(texts: list[str], model: str = "nvidia/nv-emb
     keys = [k for k in [NVIDIA_API_KEY, NVIDIA_API_KEY_2] if k]
     last_exc = None
 
+    # nv-embedqa-* NIM models hard-cap input at 512 tokens; callers upstream
+    # (topics.py etc.) truncate by character count for other providers, which
+    # isn't tight enough — a real 400 showed 2000 chars tokenizing to 1024
+    # tokens (~2 chars/token for this content), not the ~4 chars/token
+    # assumed elsewhere. 800 chars keeps ~2x margin under the 512 cap even
+    # at that density.
+    embed_max_chars = 800 if "embedqa" in model else MAX_CHARS
+
     for attempt in range(4):  # 4 attempts total
         for key_i, key in enumerate(keys):
             headers = {
@@ -72,7 +80,7 @@ async def _nvidia_embed_with_retry(texts: list[str], model: str = "nvidia/nv-emb
                 "Content-Type": "application/json",
             }
             payload = {
-                "input": [_truncate(t) for t in texts],
+                "input": [_truncate(t, embed_max_chars) for t in texts],
                 "model": model,
                 "encoding_format": "float",
             }
