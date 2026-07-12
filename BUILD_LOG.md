@@ -678,3 +678,67 @@ trigger, adaptive revisit, crawl_runs rows). Full suite: 62 passed, 1 skipped.
 **Honest limits:** incremental mode re-enriches Layer-0 (bot re-fetch) only
 for changed pages — unchanged pages keep stored access_gaps; page signals in
 incremental context rebuild content from active chunks (approximation).
+
+---
+
+## Speed: Ollama Cloud model (optional, 2026-07-12)
+
+Local qwen2.5:7b on CPU was ~120s/call, making live proofs take 20-25 min.
+The user is signed into Ollama Cloud, whose models route through the SAME
+`ollama.chat` API — so `providers.llm_complete` uses them with ZERO code
+changes, just the model name. Set `LLM_MODEL=gpt-oss:120b-cloud` in `.env.local`
+(gitignored, per-user). Measured: 1.8-2.0s/call in JSON mode (~60x faster),
+schema-clean output (Organization/Person/Product).
+- The CODE default is UNCHANGED: `LLM_MODEL=qwen2.5:7b-instruct`, fully local,
+  zero keys. Cloud is a per-machine override, requires `ollama signin`, and is
+  NOT zero-key. The earlier zero-key end-to-end proof stands on local qwen.
+
+## PHASE 3 (v3 brief) — Precision upgrades (2026-07-12)
+
+**3a — Formal chunking nodes (`src/chunking2.py`):**
+- Step 1 pysbd segmentation + abbreviation-merge post-pass. Live smoke:
+  "The firm is old. Est. 2021, it employs many researchers. It ships tools."
+  -> 3 sentences, "Est. 2021..." merged (was split Est.|2021); "Dr. Smith",
+  "No. 5" handled; offsets exact slices.
+- Step 2 MiniLM semantic chunking: heading-first split, cosine-drop sub-split
+  (0.5), <=500 tokens, heading_path + (char_start,char_end) preserved. Live
+  smoke: nested heading paths correct, every chunk's offset slice matches text.
+- Tests: test_chunking2.py 7 passed (Est.2021, no-over-merge, more abbrevs,
+  heading+offset traceability, token cap forces split, both StepTraces).
+
+**3b — Structural scorer (`src/structure.py`, deterministic, no ML):**
+- Per-chunk claims_per_block / paragraph_length / numeric-series-should-be-table
+  / heading-question-alignment / schema_presence -> structure_score + flags
+  with concrete fixes + exact chunk ids, fed to Layer-3 recs. Live smoke:
+  well-structured=1.0 (>0.8), wall-of-text=0.145 (<0.4) with the 4 expected flags.
+- Tests: 4 passed (well>0.8/wall<0.4, flags real, tables ignored, trace).
+
+**3c — Stochastic fan-out (`src/fanout.py`), replaces static expansion:**
+- N=12 samples at temp 0.8 (sanctioned temp-0 exception, logged), embedding
+  dedup (cosine>=0.92) + frequency weights -> fanout_distribution. Cached per
+  query. Wired into the simulator's query_expansion node; retriever now emits
+  weighted cluster_coverage; dead ends carry fan-out weights.
+- Tests: test_structure_fanout.py fan-out 3 passed (dedup+weight, cache
+  roundtrip=N calls once then 0, stability Jaccard math) + coverage-sensitivity
+  test in test_layer2_layer3 (weighted coverage drops when covering chunk
+  removed).
+
+**Offline suite after Phase 3: 77 passed, 1 skipped.**
+
+## PHASE 4 (v3 brief) — Query demand ingestion (2026-07-12)
+
+**Built (`src/demand.py` + `run_audit.py import-queries`):**
+- parse_gkp_csv: Google Keyword Planner export (CSV/TSV, UTF-8/UTF-16 w/ BOM),
+  skips preamble rows, detects delimiter from the header row (bug fixed:
+  was detecting from a preamble line), dedups -> keyword + searches +
+  volume_bucket + log-scaled weight.
+- conversationalize: local LLM (temp 0.7) -> 2-3 conversational question
+  variants per seed, tagged {seed, variant_type, volume_bucket, weight}.
+- parse_paa: People-Also-Ask paste file merged in.
+- build_query_set: ordered by weight so high-volume gaps surface first.
+- CLI: `run_audit.py import-queries --gkp <csv> [--paa <file>] --out <json>`
+  (lightweight subcommand dispatch; existing `--url` audit flow untouched).
+
+**Tests: test_demand.py 6 passed** (bucket/weight monotonic, GKP preamble skip
++ dedup, UTF-16 TSV, every seed gets >=2 variants, PAA parse, build ordered by
+weight -> enterprise-crm 12K outranks free-tool 90). Offline suite: 83 passed.

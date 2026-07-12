@@ -338,7 +338,33 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
             "explanations": explanations, "report_path": str(json_path)}
 
 
+def cmd_import_queries(argv: list[str]) -> None:
+    """`run_audit.py import-queries --gkp <csv> [--paa <file>] --out <json>`."""
+    from src.demand import build_query_set
+    ap = argparse.ArgumentParser(prog="run_audit.py import-queries",
+                                 description="Ingest real query demand (Phase 4).")
+    ap.add_argument("--gkp", help="Google Keyword Planner CSV/TSV export")
+    ap.add_argument("--paa", help="People-Also-Ask paste file (one per line)")
+    ap.add_argument("--max-variants", type=int, default=3)
+    ap.add_argument("--out", default="data/queries_imported.json")
+    args = ap.parse_args(argv)
+    if not args.gkp and not args.paa:
+        ap.error("provide --gkp and/or --paa")
+    queries = build_query_set(args.gkp, args.paa, args.max_variants)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(queries, indent=2), encoding="utf-8")
+    seeds = len({q["seed"] for q in queries if q.get("seed")})
+    print(f"Imported {len(queries)} queries from {seeds} seeds "
+          f"(ordered by volume weight) -> {args.out}")
+
+
 def main() -> None:
+    # Lightweight subcommand dispatch (keeps `run_audit.py --url ...` working;
+    # Phase 4+ add import-queries / diff / whatif / calibrate / import-logs).
+    if len(sys.argv) > 1 and sys.argv[1] == "import-queries":
+        cmd_import_queries(sys.argv[2:])
+        return
+
     ap = argparse.ArgumentParser(
         description="Traced, local-first AI-search readiness audit (Layers 1-3).")
     ap.add_argument("--url", required=True, help="Root URL to audit")
