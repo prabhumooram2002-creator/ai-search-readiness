@@ -37,8 +37,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-org/ai-search-readiness"
-Documentation = "https://github.com/your-org/ai-search-readiness#readme"
+Homepage = "https://github.com/prabhumooram2002-creator/ai-search-readiness"
+Documentation = "https://github.com/prabhumooram2002-creator/ai-search-readiness#readme"
 
 [project.scripts]
 ai-search = "src.main:main"

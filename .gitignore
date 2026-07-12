@@ -62,3 +62,11 @@ calibration/
 
 # Phase 8 generated fix artifacts (per-run drafts)
 fixes/
+
+# Claude Code agent memory (per-user, not project source)
+MEMORY.md
+memory/
+
+# Ad-hoc one-off audit runs (site-specific working dirs, not part of the tool)
+wickedgud_audit/
+wickedgud_audit_queries.txt
