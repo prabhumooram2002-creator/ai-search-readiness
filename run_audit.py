@@ -63,6 +63,42 @@ def load_queries(path: str | None, inline: list[str] | None) -> list[str]:
     return queries
 
 
+def load_query_weights(path: str | None, gkp_path: str | None) -> dict[str, float]:
+    """PHASE 10 S2 prioritization needs real query-volume weight (CLAUDE.md:
+    'Volume bucket becomes a query weight in reporting'). Separate from
+    load_queries() (which stays list[str] — untouched, zero risk to its
+    existing callers/tests) so this is purely additive.
+
+    - A Phase-4 import-queries JSON file (``{query, weight, ...}`` records)
+      carries its own weights straight through.
+    - A fresh --gkp CSV (not yet conversationalized) is matched to the
+      literal --queries text by substring, best-effort.
+    - Anything else defaults to uniform weight 1.0 — honest, not zero;
+      CLAUDE.md never says un-weighted queries should be ignored, just that
+      real demand data should surface gaps first when it exists.
+    """
+    weights: dict[str, float] = {}
+    if path:
+        p = Path(path)
+        if p.suffix.lower() == ".json":
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    for q in data:
+                        if isinstance(q, dict) and q.get("query"):
+                            weights[q["query"]] = float(q.get("weight", 1.0))
+            except (json.JSONDecodeError, OSError):
+                pass
+    if gkp_path:
+        from src.demand import parse_gkp_csv
+        for kw in parse_gkp_csv(gkp_path):
+            weights.setdefault(kw["keyword"], kw["weight"])
+            for q in list(weights):
+                if kw["keyword"].lower() in q.lower():
+                    weights[q] = max(weights.get(q, 0.0), kw["weight"])
+    return weights
+
+
 def _unload_extraction_models() -> None:
     """Free GLiNER/GLiREL/spaCy before Layer 2 — the full local model set does
     not fit in RAM at once on this class of machine (see BUILD_LOG OOM)."""
@@ -306,14 +342,128 @@ def write_reports(ctx: dict, traces: list[Trace], explanations: list[dict],
     for rows in explanations:
         lines.append(render_markdown(rows))
         lines.append("")
-    md_path = out_dir / "audit_report.md"
+    # PHASE 10: this trace dump is the debug appendix now — engineers need it,
+    # clients never see it. The client-facing document is report.html
+    # (build_decision_report, called from run() when --fixes is set).
+    md_path = out_dir / "audit_report_debug.md"
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return json_path
 
 
+def build_decision_report(ctx: dict, traces: list[Trace], explanations: list[dict],
+                          struct: list[dict], fx: dict | None,
+                          query_weights: dict[str, float], out_dir: Path) -> Path:
+    """PHASE 10: assemble the five-section client report.html. Only called
+    when --fixes was passed — 10a's impact chain has nothing to chain
+    without Phase 8 fix artifacts to run through the what-if overlay."""
+    from src.impact import attach_predicted_impact
+    from src.report.decision_report import (
+        build_verdict, build_action_plan, build_battle_cards,
+        build_technical_section, build_trend_section, render_report_html,
+        enforce_renderer_rules)
+    from src.snapshots import list_snapshots, load_snapshot, diff_snapshots
+
+    persist_paths = [str(BASE_DIR / "data" / "chromadb"), str(BASE_DIR / "data" / "kg.kuzu")]
+    manifest = (fx or {}).get("manifest", [])
+
+    # chunk_id -> {url, heading_path, text} — every S2/S3 row resolves through
+    # this; heading_path is empty for chunks from the default chunker (only
+    # chunking2.py's formal chunker populates it — see BUILD_LOG Phase 10 note).
+    chunk_lookup = {c["chunk_id"]: {"url": c.get("url", ""),
+                                    "heading_path": c.get("heading_path", []),
+                                    "text": c.get("content", "")}
+                    for c in ctx["chunks"]}
+
+    query_recommendations = []
+    for t, rows in zip(traces, explanations):
+        recs = rows["recommendations"]
+        if manifest:
+            attach_predicted_impact(recs, manifest, t.query, ctx["chunks"],
+                                    ctx["embeddings"], persist_paths=persist_paths)
+        query_recommendations.append((t.query, query_weights.get(t.query, 1.0), recs))
+
+    inv = ctx.get("invisibility") or {}
+    pages_no_schema = [{"url": p["url"]} for p in ctx["l0_pages"] if not p.get("schema_jsonld")]
+    action_plan = build_action_plan(
+        query_recommendations=query_recommendations, structure_flags=struct,
+        invisibility_worst_pages=inv.get("worst_pages", []),
+        schema_missing_pages=pages_no_schema[:10],
+        visited_but_invisible=[], chunk_lookup=chunk_lookup)
+
+    struct_scores = [s["structure_score"] for s in struct]
+    mean_structure = round(sum(struct_scores) / len(struct_scores), 4) if struct_scores else 0.0
+    auth_scores = [v["source_authority"] for v in ctx["page_signals"].values()]
+    mean_authority = round(sum(auth_scores) / len(auth_scores), 4) if auth_scores else 0.0
+    top_deltas = [r["predicted_impact"]["delta"] for r in action_plan[:5]
+                 if r.get("predicted_impact", {}).get("kind") == "coverage"]
+    verdict = build_verdict(inv, [{"weighted_coverage": next(
+        (s.outputs.get("cluster_coverage", {}).get("weighted_coverage")
+         for s in t.steps if s.name == "retriever"), None)} for t in traces],
+        mean_structure, mean_authority, top_deltas)
+
+    query_records = [{"query": t.query, "weight": query_weights.get(t.query, 1.0),
+                      "answer": t.answer, "confidence": t.confidence,
+                      "n_citations": len(t.citations),
+                      "retrieval_dead_ends": t.retrieval_dead_ends} for t in traces]
+    battle_cards = build_battle_cards(query_records, action_plan, top_n=10)
+
+    inbound: dict[str, int] = {}
+    for p in ctx["l0_pages"]:
+        for link in p.get("internal_links", []):
+            inbound[link["dest_url"]] = inbound.get(link["dest_url"], 0) + 1
+    orphan_pages = [p["url"] for p in ctx["l0_pages"] if inbound.get(p["url"], 0) == 0]
+    robots_conflicts = sum(len(p.get("robots_conflict", [])) for p in ctx["l0_pages"])
+    # Missing page-to-page links: pages sharing a Topic with no direct
+    # InternalLink edge between them — a lightweight version of the spec's
+    # "pairs of pages covering the same fan-out sub-intent" check, since that
+    # needs a per-page sub-intent map this pipeline doesn't compute; topic
+    # co-membership is the closest signal already in the graph.
+    missing_links: list[dict] = []
+    try:
+        res = ctx["kg"]._exec(
+            "MATCH (a:Page)-[:HasChunk]->(:Chunk)-[:BelongsToTopic]->(t:Topic)"
+            "<-[:BelongsToTopic]-(:Chunk)<-[:HasChunk]-(b:Page) "
+            "WHERE a.url < b.url "
+            "AND NOT EXISTS { MATCH (a)-[:InternalLink]->(b) } "
+            "AND NOT EXISTS { MATCH (b)-[:InternalLink]->(a) } "
+            "RETURN DISTINCT a.url, b.url, t.label LIMIT 15")
+        while res.has_next():
+            r = res.get_next()
+            missing_links.append({"a": r[0], "b": r[1], "topic": r[2]})
+    except Exception as exc:
+        logger.warning(f"[decision_report] missing-links query skipped: {exc}")
+    technical = build_technical_section(
+        invisibility=inv, robots_conflicts=robots_conflicts, orphan_pages=orphan_pages,
+        missing_links=missing_links,
+        llms_txt_present=any(m["type"] == "llms_txt" for m in manifest),
+        serverlogs=None)
+
+    trend = None
+    runs = list_snapshots()
+    if len(runs) >= 2:
+        trend = build_trend_section(diff_snapshots(load_snapshot(runs[-2]), load_snapshot(runs[-1])))
+
+    report_ctx = {"url": ctx["site_report"]["url"], "verdict": verdict,
+                 "action_plan": action_plan, "battle_cards": battle_cards,
+                 "technical": technical, "trend": trend}
+    html = render_report_html(report_ctx)
+    violations = enforce_renderer_rules(html)
+    if violations:
+        # 10c is a hard rule, not a suggestion — a report that leaks jargon or
+        # bare chunk ids to a client is a build failure, not a warning.
+        raise RuntimeError(f"Phase 10 renderer rule violation(s): {violations}")
+
+    report_path = out_dir / "report.html"
+    report_path.write_text(html, encoding="utf-8")
+    logger.info(f"[decision_report] wrote {report_path} "
+               f"(grade={verdict['grade']['grade']}, {len(action_plan)} action rows, "
+               f"{len(battle_cards)} battle cards)")
+    return report_path
+
+
 def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
         fresh: bool, claims_cap: int = 25, mode: str = "full",
-        emit_fixes: bool = False) -> dict:
+        emit_fixes: bool = False, query_weights: dict[str, float] | None = None) -> dict:
     from src.simulator import run_query
     from src.explain import explain_query
 
@@ -349,6 +499,7 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
     ctx["snapshot_run_id"] = run_id
 
     # Phase 8 — emit ready-to-use fix artifacts (draft, human-review) if asked
+    fx = None
     if emit_fixes:
         from src.fixes import generate_fixes
         pages_no_schema = [p for p in ctx["l0_pages"] if not p.get("schema_jsonld")]
@@ -370,8 +521,18 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
 
     json_path = write_reports(ctx, traces, explanations, out_dir)
     logger.info(f"[report] wrote {json_path}")
+
+    # Phase 10 — the client-facing decision report. Needs Phase 8's fix
+    # artifacts to chain through 10a's impact overlay, so it only renders
+    # when --fixes was passed (same as the fixes_dir gate above).
+    report_html_path = None
+    if emit_fixes:
+        report_html_path = build_decision_report(
+            ctx, traces, explanations, struct, fx, query_weights or {}, out_dir)
+
     return {"site_report": ctx["site_report"], "traces": traces,
-            "explanations": explanations, "report_path": str(json_path)}
+            "explanations": explanations, "report_path": str(json_path),
+            "decision_report_path": str(report_html_path) if report_html_path else None}
 
 
 def cmd_import_queries(argv: list[str]) -> None:
@@ -546,7 +707,12 @@ def main() -> None:
     ap.add_argument("--full", action="store_true",
                     help="Force a full rebuild even when a baseline exists")
     ap.add_argument("--fixes", action="store_true",
-                    help="Emit ready-to-use fix artifacts (draft) to fixes/<run>/")
+                    help="Emit ready-to-use fix artifacts (draft) to fixes/<run>/, "
+                         "and (Phase 10) the client report.html chaining them "
+                         "through the predicted-impact overlay")
+    ap.add_argument("--gkp", help="Google Keyword Planner CSV — real query-volume "
+                                  "weight for Phase 10's action-plan prioritization "
+                                  "(optional; uniform weight 1.0 without it)")
     args = ap.parse_args()
 
     # Phase 2 mode resolution: incremental is the default once a baseline
@@ -563,13 +729,17 @@ def main() -> None:
         mode = "full"
 
     queries = load_queries(args.queries, args.query)
+    query_weights = load_query_weights(args.queries, args.gkp)
     logger.info(f"Auditing {args.url} with {len(queries)} queries mode={mode} "
                 f"(LLM={providers.LLM_PROVIDER}:{providers.LLM_MODEL}, "
-                f"EMBED={providers.EMBED_PROVIDER}:{providers.EMBED_MODEL})")
+                f"EMBED={providers.EMBED_PROVIDER}:{providers.EMBED_MODEL})"
+                + (f" gkp={args.gkp}" if args.gkp else ""))
     result = run(args.url, queries, Path(args.out), args.max_pages,
                  fresh=not args.no_fresh, claims_cap=args.claims_cap, mode=mode,
-                 emit_fixes=args.fixes)
+                 emit_fixes=args.fixes, query_weights=query_weights)
     print(f"\nReport written to {result['report_path']}")
+    if result.get("decision_report_path"):
+        print(f"Decision report (Phase 10): {result['decision_report_path']}")
 
 
 if __name__ == "__main__":
