@@ -488,6 +488,30 @@ def cmd_whatif(argv: list[str]) -> int:
     return 0
 
 
+def cmd_import_logs(argv: list[str]) -> int:
+    """`run_audit.py import-logs <access.log ...>` — AI-bot crawl-demand map."""
+    from src.serverlogs import import_logs
+    from src.incremental import IncrementalState
+    ap = argparse.ArgumentParser(prog="run_audit.py import-logs")
+    ap.add_argument("logs", nargs="+")
+    args = ap.parse_args(argv)
+    state = IncrementalState()
+    urls = {c["url"] for c in state.active_chunks() if c.get("url")}
+    state.close()
+    pages = [{"url": u} for u in urls]
+    r = import_logs(args.logs, pages)
+    print(r["headline"])
+    print(f"  parsed {r['lines_total']} lines ({r['lines_malformed']} malformed), "
+          f"{r['bot_hits']} AI-bot hits")
+    print(f"  per bot: {r['per_bot']}")
+    if r["never_visited"]:
+        print(f"  never visited by AI bots ({len(r['never_visited'])}): "
+              f"{r['never_visited'][:5]}{' ...' if len(r['never_visited'])>5 else ''}")
+    if r["visited_but_invisible"]:
+        print(f"  HIGH PRIORITY (visited AND invisible): {r['visited_but_invisible']}")
+    return 0
+
+
 from src.core.config import BASE_DIR  # noqa: E402 (used by cmd_whatif)
 
 
@@ -503,6 +527,8 @@ def main() -> None:
         raise SystemExit(cmd_calibrate(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "whatif":
         raise SystemExit(cmd_whatif(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "import-logs":
+        raise SystemExit(cmd_import_logs(sys.argv[2:]))
 
     ap = argparse.ArgumentParser(
         description="Traced, local-first AI-search readiness audit (Layers 1-3).")

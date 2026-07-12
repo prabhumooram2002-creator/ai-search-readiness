@@ -847,3 +847,31 @@ Offline suite: 98 passed, 1 skipped.
 - LIVE (gpt-oss:120b-cloud): FAQ grounded in the given claim ("30-day
   money-back guarantee"); numeric prose rewritten into a real markdown table.
 Offline suite: 103 passed, 1 skipped.
+
+## PHASE 9 (v3 brief) — Server log ingestion (2026-07-12)
+
+**Built (`src/serverlogs.py` + `run_audit.py import-logs`):**
+- Combined/Common log parser; malformed lines counted + skipped (never fatal).
+- AI-bot UA filter: GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot,
+  Claude-SearchBot, PerplexityBot, Perplexity-User, Google-Extended,
+  Meta-ExternalAgent, Bytespider.
+- Crawl-demand map: per-bot hit counts, per-page bot hits, pages in the KG but
+  NEVER visited, winning pages never visited (the killer finding), and
+  visited-AND-invisible cross-ref with Layer-0 access_gaps (highest priority).
+- CLI: `run_audit.py import-logs <access.log ...>` (joins to indexed pages).
+
+**Verification (test_serverlogs.py 5 passed):** sample log -> per-bot counts
+GPTBot 2 / ClaudeBot 2 (human UA excluded); 1 malformed line counted not
+crashed; /features (a Page node absent from logs) in never_visited; a winning
+page never visited surfaces as winning_pages_never_visited; visited+invisible
+cross-ref flags /pricing. Offline suite: 108 passed, 1 skipped.
+
+---
+
+## v3 BRIEF STATUS — Phases 0-9 COMPLETE
+Phase 0 (commit history) ... Phase 9 (server logs): all built, verified, and
+committed on phase branches. Ollama Cloud enabled (~60x faster LLM) with the
+local zero-key default preserved. Suite: 108 passed, 1 skipped.
+Remaining = v3 BACKLOG only: node2vec, Common Crawl backlinks, GLiREL
+over-generation floor, rerank recall benchmark, topic-noise at full corpus
+scale, competitor comparison, legacy src.main tracing.
