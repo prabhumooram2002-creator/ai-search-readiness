@@ -332,6 +332,20 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
     # that actually won retrievals for this query set
     winner_urls = {c["page_url"] for t in traces for c in t.citations if c["page_url"]}
     ctx["invisibility"] = invisibility_score(ctx["l0_pages"], winner_urls)
+
+    # Phase 3b structural scores + Phase 5 snapshot persistence
+    from src.structure import score_chunks
+    from src.snapshots import build_snapshot, save_snapshot
+    pages_with_schema = {p["url"] for p in ctx["l0_pages"]
+                         if p.get("schema_jsonld")}
+    struct = score_chunks(
+        [{"id": c["chunk_id"], "text": c["content"], "page_url": c["url"],
+          "heading_path": c.get("heading_path", [])} for c in ctx["chunks"]],
+        pages_with_schema=pages_with_schema)
+    snap = build_snapshot(url, ctx["invisibility"], struct,
+                          ctx["page_signals"], traces)
+    ctx["snapshot_run_id"] = save_snapshot(snap)
+
     json_path = write_reports(ctx, traces, explanations, out_dir)
     logger.info(f"[report] wrote {json_path}")
     return {"site_report": ctx["site_report"], "traces": traces,
@@ -358,12 +372,34 @@ def cmd_import_queries(argv: list[str]) -> None:
           f"(ordered by volume weight) -> {args.out}")
 
 
+def cmd_diff(argv: list[str]) -> int:
+    """`run_audit.py diff [--from N --to M]` — regressions since a prior run.
+    Non-zero exit when a regression exceeds threshold (cron/CI usable)."""
+    from src.snapshots import (list_snapshots, load_snapshot, diff_snapshots,
+                               render_diff)
+    ap = argparse.ArgumentParser(prog="run_audit.py diff")
+    ap.add_argument("--from", dest="frm", type=int)
+    ap.add_argument("--to", dest="to", type=int)
+    args = ap.parse_args(argv)
+    runs = list_snapshots()
+    if len(runs) < 2 and not (args.frm and args.to):
+        print("Need at least two snapshots to diff.")
+        return 2
+    frm = args.frm or runs[-2]
+    to = args.to or runs[-1]
+    d = diff_snapshots(load_snapshot(frm), load_snapshot(to))
+    print(render_diff(d))
+    return 1 if d["ci_status"] == "fail" else 0
+
+
 def main() -> None:
     # Lightweight subcommand dispatch (keeps `run_audit.py --url ...` working;
     # Phase 4+ add import-queries / diff / whatif / calibrate / import-logs).
     if len(sys.argv) > 1 and sys.argv[1] == "import-queries":
         cmd_import_queries(sys.argv[2:])
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "diff":
+        raise SystemExit(cmd_diff(sys.argv[2:]))
 
     ap = argparse.ArgumentParser(
         description="Traced, local-first AI-search readiness audit (Layers 1-3).")
