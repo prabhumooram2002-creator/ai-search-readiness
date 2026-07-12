@@ -28,6 +28,11 @@ logger = get_logger(__name__)
 
 GLINER_MODEL = os.getenv("GLINER_MODEL", "urchade/gliner_large-v2.1")
 
+# The cross-check only needs a NER model, not the full transformer pipeline —
+# en_core_web_sm (~13MB, CNN-based) is far lighter than en_core_web_trf
+# (~500MB+ roberta) for machines where the local model set won't fit in RAM.
+SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_trf")
+
 # CLAUDE.md Layer 1 step 3 default label set (configurable per call).
 DEFAULT_LABELS = [
     "person", "organization", "product", "feature", "price", "date", "location",
@@ -76,8 +81,8 @@ def _get_spacy():
     global _spacy_nlp
     if _spacy_nlp is None:
         import spacy  # lazy
-        logger.info("Loading spaCy en_core_web_trf for NER cross-check...")
-        _spacy_nlp = spacy.load("en_core_web_trf")
+        logger.info(f"Loading spaCy {SPACY_MODEL} for NER cross-check...")
+        _spacy_nlp = spacy.load(SPACY_MODEL)
     return _spacy_nlp
 
 

@@ -19,6 +19,7 @@ importing this module is cheap and never fails when models aren't pulled yet.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -45,6 +46,7 @@ EMBED_DIM = 1024  # BGE-M3 == NVIDIA nv-embedqa-e5-v5 == 1024; Kuzu FLOAT[1024] 
 
 # ── Lazy singletons ─────────────────────────────────────────────────────────
 _st_model = None       # sentence-transformers BGE-M3
+_st_model_lock = threading.Lock()
 _ollama_ok: bool | None = None
 
 
@@ -132,9 +134,11 @@ def _resolve_embed_provider() -> str:
 def _get_st_model():
     global _st_model
     if _st_model is None:
-        from sentence_transformers import SentenceTransformer  # lazy (pulls torch)
-        logger.info(f"Loading local embedder {EMBED_MODEL} (first load downloads the model)...")
-        _st_model = SentenceTransformer(EMBED_MODEL)
+        with _st_model_lock:
+            if _st_model is None:
+                from sentence_transformers import SentenceTransformer  # lazy (pulls torch)
+                logger.info(f"Loading local embedder {EMBED_MODEL} (first load downloads the model)...")
+                _st_model = SentenceTransformer(EMBED_MODEL)
     return _st_model
 
 

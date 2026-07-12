@@ -15,15 +15,26 @@ Layer 1 step 3 (``src/ner.py``). No API keys, no LLM calls.
 """
 from __future__ import annotations
 
+import json as _json
 import os
 import re
 from typing import Optional
 
+from . import providers
 from .core.logging import get_logger
 
 logger = get_logger(__name__)
 
 GLIREL_MODEL = os.getenv("GLIREL_MODEL", "jackboyla/glirel-large-v0")
+
+# RELATION_PROVIDER=llm swaps GLiREL (1.8GB local model, GPU/CPU-heavy) for the
+# already-configured cloud LLM (see src/providers.py) doing structured-JSON
+# relation extraction per chunk. Zero extra local memory — no model load at
+# all. Lower recall than GLiREL's zero-shot span model, no raw confidence
+# score (nominal score below), but works on machines where the local model
+# set won't fit in RAM. Added for a memory-constrained (~8GB) audit run.
+RELATION_PROVIDER = os.getenv("RELATION_PROVIDER", "glirel").strip().lower()
+LLM_RELATION_SCORE = 0.75  # nominal confidence — no native score from LLM path
 
 # Default zero-shot relation label set (configurable per call). Natural-language
 # labels — that's what GLiREL is trained to match against.
@@ -120,6 +131,171 @@ def _char_span_to_token_span(
     return start_tok, end_tok
 
 
+def _record_triplet(
+    triplets: dict[tuple, dict], id_to_type: dict[str, str],
+    subj: str, relation: str, obj: str, score: float, chunk_id: str, st=None,
+) -> None:
+    """Shared post-processing for one candidate triplet (GLiREL or LLM path):
+    self-relation drop, type-constraint check, symmetric canonicalization,
+    dedup-by-key with best-score-kept. Mutates ``triplets`` in place."""
+    if subj == obj:
+        if st is not None:
+            st.drop({"entity_id": subj, "relation": relation, "chunk_id": chunk_id},
+                    "self-relation")
+        return
+    if not _type_ok(relation, id_to_type.get(subj, ""), id_to_type.get(obj, "")):
+        if st is not None:
+            st.drop({"triplet": (subj, relation, obj),
+                     "head_type": id_to_type.get(subj),
+                     "tail_type": id_to_type.get(obj)},
+                    "type constraint violated")
+        return
+    if relation in SYMMETRIC_RELATIONS and subj > obj:
+        subj, obj = obj, subj
+    key = (subj, relation, obj)
+    t = triplets.get(key)
+    if t is None:
+        triplets[key] = {
+            "subject_entity_id": subj, "relation": relation,
+            "object_entity_id": obj, "source_chunk_id": chunk_id,
+            "source_chunk_ids": [chunk_id], "support_count": 1, "score": score,
+        }
+    else:
+        t["support_count"] += 1
+        if chunk_id not in t["source_chunk_ids"]:
+            t["source_chunk_ids"].append(chunk_id)
+        t["score"] = max(t["score"], score)
+
+
+def _finalize_triplets(triplets: dict[tuple, dict], st=None) -> list[dict]:
+    """Precision-floor filter (corroborated edges get a lower bar) + sort."""
+    deduped = list(triplets.values())
+    kept = []
+    for t in deduped:
+        floor = PRECISION_FLOOR - (0.1 if t["support_count"] >= 2 else 0.0)
+        if t["score"] >= floor:
+            kept.append(t)
+        elif st is not None:
+            st.drop({"triplet": (t["subject_entity_id"], t["relation"],
+                                 t["object_entity_id"]), "score": t["score"]},
+                    f"below precision floor {floor:.2f}")
+    return sorted(kept, key=lambda t: -t["score"])
+
+
+LLM_RELATION_PROMPT = """You extract relationships between named entities from website content.
+
+Entities found in this chunk (name: type):
+{entity_list}
+
+Content:
+{content}
+
+Allowed relation labels ONLY: {labels}
+
+Rules:
+- Only relate entities from the list above, using their exact name.
+- Only use the allowed relation labels — do not invent new ones.
+- Only return relations explicitly stated or clearly implied by the content.
+- If no relations exist, return an empty list.
+
+Return ONLY valid JSON, exactly this shape:
+{{"relations": [{{"subject": "<entity name>", "relation": "<label>", "object": "<entity name>"}}]}}"""
+
+
+def _parse_llm_relations_json(raw: str) -> list[dict]:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        data = _json.loads(text)
+        rels = data.get("relations", [])
+        return rels if isinstance(rels, list) else []
+    except Exception:
+        return []
+
+
+def _extract_relations_llm(
+    chunks: list[dict], entities: list[dict], labels: list[str], trace=None,
+) -> list[dict]:
+    """RELATION_PROVIDER=llm path: structured-JSON extraction via the
+    configured cloud/local LLM (``providers.llm_complete``) instead of the
+    local GLiREL model. No extra model load — reuses whatever LLM_PROVIDER is
+    already configured for claim extraction."""
+    id_to_type: dict[str, str] = {e["id"]: e.get("type", "") for e in entities}
+    mentions_by_chunk: dict[str, list[dict]] = {}
+    for e in entities:
+        for m in e.get("mentions", []):
+            mentions_by_chunk.setdefault(str(m["chunk_id"]), []).append(e)
+
+    step_cm = trace.start_step(
+        "relation_extraction", n_chunks=len(chunks), n_entities=len(entities),
+        labels=labels, provider="llm",
+    ) if trace is not None else None
+    st = step_cm.__enter__() if step_cm is not None else None
+
+    try:
+        triplets: dict[tuple, dict] = {}
+        raw_count = 0
+        for c in chunks:
+            chunk_id = str(c.get("chunk_id", ""))
+            chunk_entities = {e["id"]: e for e in mentions_by_chunk.get(chunk_id, [])}
+            if len(chunk_entities) < 2:
+                continue
+            # name/synonym (lowercased) -> entity_id, scoped to this chunk only
+            name_to_id: dict[str, str] = {}
+            entity_lines = []
+            for e in chunk_entities.values():
+                name_to_id[e["name"].strip().lower()] = e["id"]
+                for syn in e.get("synonyms", []):
+                    name_to_id[syn.strip().lower()] = e["id"]
+                entity_lines.append(f"- {e['name']}: {e['type']}")
+
+            prompt = LLM_RELATION_PROMPT.format(
+                entity_list="\n".join(entity_lines),
+                content=c["content"][:2000],
+                labels=", ".join(labels),
+            )
+            try:
+                raw = providers.llm_complete(prompt, json=True, temperature=0)
+            except Exception as exc:
+                logger.warning(f"LLM relation extraction failed for chunk {chunk_id}: {exc}")
+                continue
+            preds = _parse_llm_relations_json(raw)
+            raw_count += len(preds)
+            for p in preds:
+                subj = name_to_id.get(str(p.get("subject", "")).strip().lower())
+                obj = name_to_id.get(str(p.get("object", "")).strip().lower())
+                relation = str(p.get("relation", "")).strip().lower()
+                if subj is None or obj is None or relation not in labels:
+                    if st is not None:
+                        st.drop({"raw": p, "chunk_id": chunk_id},
+                                "endpoint not in chunk entities or label not allowed")
+                        continue
+                _record_triplet(triplets, id_to_type, subj, relation, obj,
+                                LLM_RELATION_SCORE, chunk_id, st)
+
+        out = _finalize_triplets(triplets, st)
+        logger.info(
+            f"LLM relations: {raw_count} raw -> {len(triplets)} deduped -> "
+            f"{len(out)} kept (provider=llm, nominal score={LLM_RELATION_SCORE})"
+        )
+        if st is not None:
+            st.outputs["triplets"] = out
+            st.outputs["n_raw_predictions"] = raw_count
+            st.scores["n_triplets"] = float(len(out))
+        return out
+    except BaseException as exc:
+        if step_cm is not None:
+            step_cm.__exit__(type(exc), exc, exc.__traceback__)
+            step_cm = None
+        raise
+    finally:
+        if step_cm is not None:
+            step_cm.__exit__(None, None, None)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Extraction
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,6 +316,15 @@ def extract_relations(
                 "source_chunk_id", "score"}] deduplicated, best score kept.
     """
     labels = labels or DEFAULT_RELATION_LABELS
+
+    if RELATION_PROVIDER == "llm":
+        return _extract_relations_llm(chunks, entities, labels, trace=trace)
+
+    if os.getenv("SKIP_RELATIONS", "").strip().lower() in ("1", "true", "yes"):
+        logger.warning("SKIP_RELATIONS set -> skipping GLiREL relation extraction "
+                       "(memory-constrained run; no relationship edges in this KG)")
+        return []
+
     model = _get_glirel()
 
     step_cm = trace.start_step(
