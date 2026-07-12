@@ -432,6 +432,43 @@ def cmd_calibrate(argv: list[str]) -> int:
     return 0
 
 
+def cmd_whatif(argv: list[str]) -> int:
+    """`run_audit.py whatif --draft <md|txt|docx> --query "..." [...]` — predict
+    a draft's coverage impact against a non-persisting overlay index."""
+    from src.whatif import whatif
+    from src.incremental import IncrementalState
+    from src.embed import embed_chunks_sync
+    ap = argparse.ArgumentParser(prog="run_audit.py whatif")
+    ap.add_argument("--draft", required=True)
+    ap.add_argument("--query", action="append", required=True,
+                    help="target query (repeatable)")
+    args = ap.parse_args(argv)
+
+    state = IncrementalState()
+    base_chunks = state.active_chunks()
+    state.close()
+    if not base_chunks:
+        print("No baseline index — run an audit first."); return 2
+    base_embs = embed_chunks_sync([c["content"] for c in base_chunks], use_cache=True)
+    persist = [str(BASE_DIR / "data" / "chromadb"),
+               str(BASE_DIR / "data" / "kg.kuzu")]
+    res = whatif(args.draft, args.query, base_chunks, base_embs, persist_paths=persist)
+    print(f"What-if for {args.draft} ({res['n_draft_chunks']} draft chunks, "
+          f"mean structure {res['mean_structure_score']}):")
+    for pq in res["per_query"]:
+        print(f"  {pq['query'][:50]!r}: coverage {pq['coverage_before']} -> "
+              f"{pq['coverage_after']} (delta {pq['coverage_delta']:+}, "
+              f"+{pq['newly_covered']} sub-intents)")
+    print(f"  persistent stores unchanged: {res['stores_unchanged']}")
+    if res["structure_flags"]:
+        print(f"  draft structure flags: "
+              f"{sorted({f['flag'] for f in res['structure_flags']})}")
+    return 0
+
+
+from src.core.config import BASE_DIR  # noqa: E402 (used by cmd_whatif)
+
+
 def main() -> None:
     # Lightweight subcommand dispatch (keeps `run_audit.py --url ...` working;
     # Phase 4+ add import-queries / diff / whatif / calibrate / import-logs).
@@ -442,6 +479,8 @@ def main() -> None:
         raise SystemExit(cmd_diff(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "calibrate":
         raise SystemExit(cmd_calibrate(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "whatif":
+        raise SystemExit(cmd_whatif(sys.argv[2:]))
 
     ap = argparse.ArgumentParser(
         description="Traced, local-first AI-search readiness audit (Layers 1-3).")

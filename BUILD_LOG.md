@@ -799,3 +799,24 @@ file; agreement hand-checked — simulator cited hubspot.com, ChatGPT cited it
 floor case emits the retriever-tuning note; observed dict carries label
 "observed" and NO simulated/confidence keys (never merged). Offline suite: 95
 passed, 1 skipped.
+
+## PHASE 7 (v3 brief) — Pre-publish what-if scoring (2026-07-12)
+
+**Built (`src/whatif.py` + `run_audit.py whatif`):**
+- load_draft (.md/.txt; .docx via python-docx if installed).
+- Draft -> semantic_chunks -> structural flags -> local BGE-M3 embeddings, all
+  IN MEMORY. Overlay = base_chunks + draft_chunks passed to a lightweight
+  coverage predictor (rank_bm25 0.4 + BGE cosine 0.6 + fan-out weights) that
+  never loads the reranker/NLI/synthesis and never writes any store.
+- Per target query: predicted weighted cluster-coverage before/after + delta +
+  newly-covered sub-intents; draft structure flags; store-integrity hashes.
+- CLI: `run_audit.py whatif --draft <f> --query "..."` (pulls base chunks from
+  the incremental state; overlay is transient).
+
+**Verification (test_whatif.py, 3 passed — both brief checks):**
+1. store integrity: real kg.kuzu file + chromadb dir hashed before/after ->
+   identical; files literally untouched (stores_unchanged=True).
+2. a draft answering a known dead-end sub-intent (refund policy) raises that
+   query's predicted coverage 0.5 -> 1.0 (delta +0.5, +1 sub-intent).
+   Draft structure flags surface (paragraph_too_long, numeric-series-as-table).
+Offline suite: 98 passed, 1 skipped.
