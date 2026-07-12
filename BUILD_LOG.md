@@ -742,3 +742,40 @@ schema-clean output (Organization/Person/Product).
 **Tests: test_demand.py 6 passed** (bucket/weight monotonic, GKP preamble skip
 + dedup, UTF-16 TSV, every seed gets >=2 variants, PAA parse, build ordered by
 weight -> enterprise-crm 12K outranks free-tool 90). Offline suite: 83 passed.
+
+## PHASE 5 (v3 brief) — Snapshots & regression alerts (2026-07-12)
+
+**Built (`src/snapshots.py` + `run_audit.py diff`):**
+- After every run, save a snapshot: per-page invisibility + signals + pagerank,
+  per-chunk structure_score, per-query weighted coverage + confidence breakdown
+  + winning chunks/pages. Stored as data/snapshots/run_NNNN.json.
+- diff_snapshots(a,b): reports ONLY regressions + improvements, each traced to
+  a cause (deleted covering chunk / new JS template / winning page dropped),
+  ranked by severity = magnitude x query_weight x page_pagerank.
+- CLI: `run_audit.py diff [--from N --to M]` (default last two); non-zero exit
+  when worst severity > threshold (0.1) -> cron/CI usable.
+
+**Verification (the brief's exact scenario, in test_snapshots.py):** baseline
+snapshot -> delete ONE covering chunk (c1) -> diff flags exactly the q1
+coverage regression 0.8->0.4, cause "covering chunk(s) deleted: ['c1']",
+severity = 0.4*0.9 (query weight), ci_status=fail. Invisibility regression
+carries a JS-template cause + pagerank-weighted severity. Improvements are not
+flagged as regressions.
+
+**Tests: test_snapshots.py 6 passed.** Wired snapshot-save into run_audit
+(+ structural scores). Offline suite: 90 passed, 1 skipped.
+
+## PHASE 3c FIX — fan-out stability (2026-07-12, follow-up)
+
+First LIVE 3c check FAILED honestly: MERGE_COSINE=0.92 too strict for real
+BGE-M3 embeddings of verbose gpt-oss sub-questions -> 146 singleton intents,
+top-5 unstable (string Jaccard 0.00). Fixes:
+- MERGE_COSINE 0.92 -> 0.80 (cluster paraphrases into shared intents);
+- prompt asks for 4-7 MAIN facets (short) instead of "distinct + varied".
+- Added intent_stability(): the RIGHT metric — sub-intents are semantic
+  clusters, so two runs reword the same intent; string Jaccard understates.
+  Matches top-k by embedding cosine (>=0.8).
+LIVE re-verify (cloud gpt-oss:120b): r1=18, r2=22 sub-intents;
+  string Jaccard=0.00 (wording varies) but SEMANTIC top-5 stability=0.80
+  (>=0.6 PASS). Both rounds share: exception types, custom exceptions,
+  try/except structure, specific-vs-broad catch. Offline suite: 90 passed.

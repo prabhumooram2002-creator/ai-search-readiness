@@ -56,14 +56,16 @@ def test_score_chunks_trace_and_schema_set():
 
 # ── 3c: stochastic fan-out ─────────────────────────────────────────────────
 def _stub_embed(texts):
-    # deterministic pseudo-embeddings: identical strings -> identical vectors;
-    # bucket by first word so near-duplicates cluster.
+    # deterministic one-hot by first word: identical first word -> identical
+    # vector (cosine 1); different first word -> orthogonal (cosine 0). Robust
+    # to the merge threshold (unlike hash-of-word, which drifts near 0.8).
     import hashlib
     out = []
     for t in texts:
         key = t.split()[0].lower() if t.split() else ""
-        h = int(hashlib.sha256(key.encode()).hexdigest(), 16)
-        v = [((h >> (i * 8)) & 0xFF) / 255.0 for i in range(8)]
+        dim = int(hashlib.sha256(key.encode()).hexdigest(), 16) % 32
+        v = [0.0] * 32
+        v[dim] = 1.0
         out.append(v)
     return out
 
@@ -110,3 +112,15 @@ def test_stability_jaccard_top5():
     top_b = {d["sub_query"] for d in b[:5]}
     jac = len(top_a & top_b) / len(top_a | top_b)
     assert jac >= 0.6
+
+
+def test_intent_stability_semantic(monkeypatch):
+    monkeypatch.setattr(fo.providers, "embed_texts", _stub_embed)
+    # same intents, reworded (same FIRST word clusters via the stub)
+    a = [{"sub_query": "pricing details here", "weight": 0.5},
+         {"sub_query": "security posture info", "weight": 0.5}]
+    b = [{"sub_query": "pricing options explained", "weight": 0.5},
+         {"sub_query": "security controls summary", "weight": 0.5}]
+    assert fo.intent_stability(a, b, k=2, threshold=0.8) == 1.0
+    c = [{"sub_query": "cooking recipes today", "weight": 1.0}]
+    assert fo.intent_stability(a, c, k=2, threshold=0.8) < 1.0

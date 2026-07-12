@@ -28,13 +28,17 @@ logger = get_logger(__name__)
 
 N_SAMPLES = 12
 FANOUT_TEMPERATURE = 0.8       # sanctioned exception to temp-0 (logged)
-MERGE_COSINE = 0.92            # >= this cosine -> same sub-query
+# Cluster PARAPHRASES into shared sub-intents. 0.92 was far too strict for real
+# BGE-M3 embeddings of verbose LLM sub-questions (paraphrases sit ~0.75-0.88),
+# so nothing merged -> 140+ singleton intents -> unstable top-5. 0.80 groups
+# paraphrases of the same intent while keeping distinct intents apart.
+MERGE_COSINE = 0.80
 CACHE_DIR = BASE_DIR / "data" / "fanout_cache"
 
 FANOUT_PROMPT = (
     "A user asks an AI assistant: \"{query}\"\n"
-    "List the distinct sub-questions the assistant would internally research to "
-    "answer well. Be specific and varied.\n"
+    "List the 4-7 MAIN sub-questions the assistant must resolve to answer well. "
+    "Keep each short (one facet each); cover the key angles, not edge cases.\n"
     'Return ONLY JSON: {{"sub_queries": ["...", "..."]}}')
 
 
@@ -137,6 +141,39 @@ def fanout_distribution(
     finally:
         if step_cm is not None:
             step_cm.__exit__(None, None, None)
+
+
+def intent_stability(dist_a: list[dict], dist_b: list[dict],
+                     k: int = 5, threshold: float = 0.8) -> float:
+    """Semantic top-k stability between two fan-out runs.
+
+    Sub-intents are semantic clusters, so two independent runs express the same
+    intent with different wording — literal string Jaccard understates
+    stability. This matches each of A's top-k intents to B's top-k by embedding
+    cosine (>= threshold) and returns matched / k in [0,1].
+    """
+    import numpy as np
+    a = [d["sub_query"] for d in dist_a[:k]]
+    b = [d["sub_query"] for d in dist_b[:k]]
+    if not a or not b:
+        return 0.0
+    va = providers.embed_texts(a)
+    vb = providers.embed_texts(b)
+    used, matched = set(), 0
+    for x in va:
+        x = np.asarray(x)
+        best_j, best = -1, -1.0
+        for j, y in enumerate(vb):
+            if j in used:
+                continue
+            y = np.asarray(y)
+            sim = float(x.dot(y) / ((np.linalg.norm(x) * np.linalg.norm(y)) or 1.0))
+            if sim > best:
+                best, best_j = sim, j
+        if best >= threshold and best_j >= 0:
+            used.add(best_j)
+            matched += 1
+    return round(matched / k, 4)
 
 
 def invalidate(query: str) -> None:
