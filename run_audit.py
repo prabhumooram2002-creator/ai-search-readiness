@@ -394,8 +394,19 @@ def build_decision_report(ctx: dict, traces: list[Trace], explanations: list[dic
     mean_structure = round(sum(struct_scores) / len(struct_scores), 4) if struct_scores else 0.0
     auth_scores = [v["source_authority"] for v in ctx["page_signals"].values()]
     mean_authority = round(sum(auth_scores) / len(auth_scores), 4) if auth_scores else 0.0
-    top_deltas = [r["predicted_impact"]["delta"] for r in action_plan[:5]
-                 if r.get("predicted_impact", {}).get("kind") == "coverage"]
+    # "top 5 actions" for the predicted-lift sentence means the 5 highest-
+    # impact ones. Sourced from query_recommendations (every recommendation
+    # with an impact attached), NOT from action_plan[:max_rows] — a page's
+    # JS-invisibility fix can legitimately outrank a single dead-end
+    # sub-query in the printed plan and push real coverage-delta rows past
+    # the row cap entirely, but the lift sentence still needs the true best
+    # deltas wherever they landed, or a run that DID generate fixes ends up
+    # falsely claiming it didn't.
+    coverage_deltas = sorted(
+        (rec["predicted_impact"]["delta"] for _, _, recs in query_recommendations
+         for rec in recs if rec.get("predicted_impact", {}).get("kind") == "coverage"),
+        reverse=True)
+    top_deltas = coverage_deltas[:5]
     verdict = build_verdict(inv, [{"weighted_coverage": next(
         (s.outputs.get("cluster_coverage", {}).get("weighted_coverage")
          for s in t.steps if s.name == "retriever"), None)} for t in traces],
@@ -441,7 +452,9 @@ def build_decision_report(ctx: dict, traces: list[Trace], explanations: list[dic
     trend = None
     runs = list_snapshots()
     if len(runs) >= 2:
-        trend = build_trend_section(diff_snapshots(load_snapshot(runs[-2]), load_snapshot(runs[-1])))
+        from src.report.decision_report import resolve_chunk_structure_urls
+        raw_diff = diff_snapshots(load_snapshot(runs[-2]), load_snapshot(runs[-1]))
+        trend = build_trend_section(resolve_chunk_structure_urls(raw_diff, chunk_lookup))
 
     report_ctx = {"url": ctx["site_report"]["url"], "verdict": verdict,
                  "action_plan": action_plan, "battle_cards": battle_cards,

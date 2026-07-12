@@ -13,6 +13,33 @@ from src.report import decision_report as dr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# S5 — trend chunk_structure URL resolution
+# ─────────────────────────────────────────────────────────────────────────────
+def test_chunk_structure_regression_resolves_to_url():
+    diff = {"regressions": [{"kind": "chunk_structure", "chunk_id": "abc123",
+                             "from": 0.8, "to": 0.4, "cause": "structure changed"}],
+           "improvements": []}
+    out = dr.resolve_chunk_structure_urls(diff, CHUNK_LOOKUP)
+    assert out["regressions"][0]["url"] == "https://site.com/pricing"
+
+
+def test_chunk_structure_regression_dropped_when_unresolvable():
+    diff = {"regressions": [{"kind": "chunk_structure", "chunk_id": "ghost",
+                             "from": 0.8, "to": 0.4, "cause": "structure changed"}],
+           "improvements": []}
+    out = dr.resolve_chunk_structure_urls(diff, CHUNK_LOOKUP)
+    assert out["regressions"] == []
+
+
+def test_non_chunk_structure_items_pass_through_unchanged():
+    diff = {"regressions": [{"kind": "page_invisibility", "url": "https://site.com/x",
+                             "from": 0.1, "to": 0.5, "cause": "js-only"}],
+           "improvements": []}
+    out = dr.resolve_chunk_structure_urls(diff, {})
+    assert out["regressions"] == diff["regressions"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # S1 — grade + verdict
 # ─────────────────────────────────────────────────────────────────────────────
 def test_site_grade_bands_and_formula_logged():

@@ -331,6 +331,25 @@ def build_technical_section(invisibility: dict, robots_conflicts: int,
 # ─────────────────────────────────────────────────────────────────────────────
 # S5 — Trend
 # ─────────────────────────────────────────────────────────────────────────────
+def resolve_chunk_structure_urls(diff: dict, chunk_lookup: dict) -> dict:
+    """``chunk_structure`` regressions/improvements from snapshots.diff_snapshots
+    only carry a chunk_id — never a client-facing identifier. Resolve to the
+    page URL (same rule S2 follows: unresolvable items are dropped, never
+    shown as a bare id or a dash)."""
+    out = dict(diff)
+    for bucket in ("regressions", "improvements"):
+        resolved = []
+        for item in diff.get(bucket, []):
+            if item.get("kind") == "chunk_structure":
+                info = chunk_lookup.get(item.get("chunk_id"))
+                if not info or not info.get("url"):
+                    continue
+                item = {**item, "url": info["url"]}
+            resolved.append(item)
+        out[bucket] = resolved
+    return out
+
+
 def build_trend_section(diff: Optional[dict]) -> Optional[dict]:
     if not diff:
         return None
