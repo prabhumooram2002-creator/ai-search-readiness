@@ -24,9 +24,13 @@ embed:
     - nvidia
     - deepseek
   # NVIDIA NIM free tier — confirmed working:
-  #   Embeddings: nvidia/nv-embed-v1 (4096 dim, 200 OK)
+  #   Embeddings: nvidia/nv-embedqa-e5-v5 (1024 dim — matches EMBED_DIM /
+  #     the Kuzu FLOAT[1024] schema; nv-embed-v1 is 4096-dim and was
+  #     causing "Conversion exception ... Expected: 1024, Actual: 4096"
+  #     when this path's cached vectors got mixed with the 1024-dim ones
+  #     used everywhere else)
   #   Chat: nvidia/llama-3.3-nemotron-super-49b-v1 (200 OK)
-  nvidia_embed_model: nvidia/nv-embed-v1
+  nvidia_embed_model: nvidia/nv-embedqa-e5-v5
   nvidia_chat_model: nvidia/llama-3.3-nemotron-super-49b-v1
   deepseek_embed_model: text-embedding-3-small
   deepseek_chat_model: deepseek-chat

@@ -24,12 +24,17 @@ GOOGLE_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # ─── Cache ────────────────────────────────────────────────────────────────────
 def _embed_tag() -> str:
-    """Model-aware cache namespace so local (1024-dim) and nvidia (other dim)
-    embeddings never collide in the on-disk cache."""
+    """Model-aware cache namespace so different embedding models (different
+    dims) never collide in the on-disk cache. Previously this collapsed all
+    NVIDIA models to a single "nvidia" tag, which silently mixed nv-embed-v1
+    (4096-dim) and nv-embedqa-e5-v5 (1024-dim) results and broke the Kuzu
+    FLOAT[1024] schema ("Conversion exception ... Expected: 1024, Actual:
+    4096") once both code paths got exercised in the same run."""
     from .. import providers
     if providers._resolve_embed_provider() == "local":
         return providers.EMBED_MODEL.replace("/", "_")
-    return "nvidia"
+    nvidia_model = embed_cfg().get("nvidia_embed_model", "nvidia/nv-embed-v1")
+    return f"nvidia_{nvidia_model.replace('/', '_')}"
 
 def _cache_path(content_hash: str) -> str:
     return str(CACHE_DIR / f"{_embed_tag()}__{content_hash}.json")
