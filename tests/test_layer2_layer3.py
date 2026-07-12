@@ -44,9 +44,15 @@ def _stub_nli(label_for):
 
 
 def _run(monkeypatch, nli=None, llm=None):
+    # Phase 3c: expansion routes through fan-out; stub it directly so tests
+    # stay fast (no 12x sampling) and deterministic.
+    import src.fanout as fo
+    monkeypatch.setattr(fo, "fanout_distribution",
+                        lambda q, use_cache=True, **k: [
+                            {"sub_query": "acme founding year", "weight": 0.6},
+                            {"sub_query": "acme history", "weight": 0.4}])
     monkeypatch.setattr(sim.providers, "llm_complete", llm or _stub_llm([
         '{"category": "fact-lookup", "constraints": {"entities": ["Acme"]}}',
-        '{"sub_queries": ["acme founding year", "acme history"]}',
         "Acme was founded in 2001. It is based on Mars.",
     ]))
     monkeypatch.setattr(sim.providers, "embed_texts",
@@ -144,3 +150,41 @@ def test_signals_formulas_and_labels():
     assert p2["temporal_freshness"] == 0.5     # no date evidence -> neutral
     assert any("10b pending" in n for n in p1["notes"])
     assert "heuristic" in sig.FORMULAS["trust"]
+
+
+def test_fanout_weighted_coverage_drops_when_covering_chunk_removed(monkeypatch):
+    # Phase 3c: weighted cluster coverage must fall when the chunk that covers
+    # a sub-intent is deleted. Real BM25; everything else stubbed.
+    import src.fanout as fo
+    monkeypatch.setattr(fo, "fanout_distribution",
+                        lambda q, use_cache=True, **k: [
+                            {"sub_query": "acme pricing plans cost", "weight": 0.7},
+                            {"sub_query": "acme security compliance", "weight": 0.3}])
+    monkeypatch.setattr(sim.providers, "llm_complete", _stub_llm([
+        '{"category": "fact-lookup", "constraints": {"entities": []}}',
+        "answer"] * 2))
+    # embed: match sub-query to its chunk by keyword overlap (crude but real-ish)
+    def emb(texts):
+        out = []
+        for t in texts:
+            tl = t.lower()
+            out.append([1.0 if "pricing" in tl or "cost" in tl else 0.0,
+                        1.0 if "security" in tl or "compliance" in tl else 0.0])
+        return out
+    monkeypatch.setattr(sim.providers, "embed_texts", emb)
+    monkeypatch.setattr(sim, "_get_reranker", lambda: FakeReranker())
+    monkeypatch.setattr(sim, "_score_pairs",
+                        lambda pairs: [("entailment", 0.9)] * len(pairs))
+
+    both = [{"chunk_id": "cp", "content": "acme pricing plans cost ten dollars", "url": "u1"},
+            {"chunk_id": "cs", "content": "acme security compliance soc2 audited", "url": "u2"}]
+    emb_both = emb([c["content"] for c in both])
+    full = sim.run_query("tell me about acme", both, emb_both)
+    cov_full = next(s for s in full.steps if s.name == "retriever").outputs["cluster_coverage"]
+
+    # remove the pricing chunk (covers the 0.7-weight sub-intent)
+    only_sec = [both[1]]
+    cov_gap = sim.run_query("tell me about acme", only_sec, emb([only_sec[0]["content"]])
+                            ).steps[2].outputs["cluster_coverage"]
+    assert cov_full["weighted_coverage"] > cov_gap["weighted_coverage"]
+    assert cov_full["sub_intents_covered"] > cov_gap["sub_intents_covered"]

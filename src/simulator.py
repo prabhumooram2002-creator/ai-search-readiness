@@ -101,20 +101,18 @@ def run_query(
                         "constraints": data.get("constraints", {}) or {}}
         st.outputs["intent"] = trace.intent
 
-    # ── query expansion (3-5 facet sub-queries) ─────────────────────────
-    with trace.start_step("query_expansion", query=query) as st:
-        raw = providers.llm_complete(
-            f"Generate 3 to 5 short facet sub-queries for this search query — "
-            f"different angles a search engine would explore.\nQuery: {query}\n"
-            'Return ONLY JSON: {"sub_queries": ["...", "..."]}',
-            json=True, temperature=0,
-            system="You expand search queries. Output ONLY valid JSON.")
-        subs = [str(s).strip() for s in _json_obj(raw).get("sub_queries", [])
-                if str(s).strip()][:5]
-        trace.expanded_queries = subs
-        st.outputs["expanded_queries"] = subs
-        if not subs:
-            st.note("expansion produced nothing; retrieving on the original only")
+    # ── query expansion — Phase 3c stochastic fan-out (weighted, cached) ──
+    fanout_weights: dict[str, float] = {}
+    with trace.start_step("query_expansion", query=query,
+                          method="stochastic_fanout") as st:
+        from .fanout import fanout_distribution
+        dist = fanout_distribution(query, use_cache=True)
+        trace.expanded_queries = [d["sub_query"] for d in dist]
+        fanout_weights = {d["sub_query"]: d["weight"] for d in dist}
+        st.outputs["fanout_distribution"] = dist
+        st.scores["n_sub_intents"] = float(len(dist))
+        if not dist:
+            st.note("fan-out produced nothing; retrieving on the original only")
 
     # ── hybrid retriever: rank_bm25 + BGE cosine, 0.4/0.6 ────────────────
     with trace.start_step("retriever", n_chunks=len(chunks),
@@ -145,13 +143,29 @@ def run_query(
         trace.retrieved = ranked
         st.outputs["n_candidates"] = len(ranked)
         st.scores["top_combined"] = ranked[0]["combined"] if ranked else 0.0
-        # retrieval dead ends: expanded queries whose best combined < floor
+        # Weighted cluster coverage (Phase 3c): each sub-intent carries a fan-out
+        # weight; a covered sub-intent has a chunk above the floor. Dead ends on
+        # high-weight sub-intents outrank low-weight ones.
+        covered_w = total_w = 0.0
+        covered_n = 0
         for q in queries:
             top_q = max((r["combined"] for r in best.values()
                          if r["matched_query"] == q), default=0.0)
+            w = fanout_weights.get(q, 0.0) if q != query else 0.0
+            total_w += w
             if top_q < DEAD_END_FLOOR:
-                trace.retrieval_dead_ends.append(q)
-                st.note(f"dead end: {q!r} top_combined={top_q:.2f} < {DEAD_END_FLOOR}")
+                trace.retrieval_dead_ends.append(
+                    {"sub_query": q, "weight": round(w, 4),
+                     "top_combined": round(top_q, 4)})
+                st.note(f"dead end (w={w:.2f}): {q!r} top={top_q:.2f} < {DEAD_END_FLOOR}")
+            else:
+                covered_w += w
+                covered_n += 1
+        n_intents = len(fanout_weights) or 1
+        st.outputs["cluster_coverage"] = {
+            "sub_intents_covered": covered_n, "sub_intents_total": len(fanout_weights),
+            "weighted_coverage": round(covered_w / total_w, 4) if total_w else None}
+        st.scores["weighted_coverage"] = round(covered_w / total_w, 4) if total_w else 0.0
 
     # ── rerank: bge-reranker-v2-m3 cross-encoder, keep top-5 ─────────────
     with trace.start_step("rerank", n_in=len(trace.retrieved),

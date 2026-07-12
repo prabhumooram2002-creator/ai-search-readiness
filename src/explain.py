@@ -109,9 +109,11 @@ def explain_query(trace, kg=None) -> dict:
         recs.append({"rule": "weak_evidence", "chunk_id": w["chunk_id"],
                      "action": "Add supporting data/citations near this chunk "
                                f"(NLI {w['nli_label']} {w['nli_conf']})."})
-    for q in trace.retrieval_dead_ends:
+    for de in trace.retrieval_dead_ends:
+        sub = de["sub_query"] if isinstance(de, dict) else de
+        w = f" (fan-out weight {de['weight']})" if isinstance(de, dict) else ""
         recs.append({"rule": "retrieval_dead_end",
-                     "action": f'Real content gap: no chunk answers "{q}" '
+                     "action": f'Real content gap: no chunk answers "{sub}"{w} '
                                f"above the score floor. Create content for it."})
     for s in trace.unsupported_sentences:
         recs.append({"rule": "unsupported_answer_sentence",
@@ -144,8 +146,12 @@ def render_markdown(rows: dict) -> str:
         for step, drops in rows["dropped_with_reasons"].items():
             L += [f"- [{step}] {d['reason']}" for d in drops[:10]]
     if rows["retrieval_dead_ends"]:
-        L.append("\n### Retrieval dead ends (real content gaps)")
-        L += [f"- {q}" for q in rows["retrieval_dead_ends"]]
+        L.append("\n### Retrieval dead ends (real content gaps, weighted)")
+        for de in rows["retrieval_dead_ends"]:
+            if isinstance(de, dict):
+                L.append(f"- {de['sub_query']} (weight {de['weight']})")
+            else:
+                L.append(f"- {de}")
     if rows["missing_entities"]:
         L.append("\n### Missing entities")
         L += [f"- {e}" for e in rows["missing_entities"]]
