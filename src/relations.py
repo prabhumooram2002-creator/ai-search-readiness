@@ -32,7 +32,37 @@ DEFAULT_RELATION_LABELS = [
     "competes with", "develops", "offers", "works for", "uses",
 ]
 
-DEFAULT_THRESHOLD = 0.5  # GLiREL confidence floor (heuristic)
+DEFAULT_THRESHOLD = 0.5  # GLiREL raw prediction threshold (heuristic)
+# Post-filter precision floor applied to DEDUPED edges (backlog: GLiREL
+# over-generates — 84 raw predictions from 3 sentences). Env-tunable.
+# NOTE (measured): the floor alone was insufficient — it cut only 23% of edges
+# and left high-scoring nonsense (e.g. "San Francisco founded-by Dario Amodei"
+# 0.87). Type constraints below are what actually recover precision.
+import os
+PRECISION_FLOOR = float(os.getenv("GLIREL_PRECISION_FLOOR", "0.6"))
+
+# Per-relation allowed (head_types, tail_types). None = any type allowed.
+# Types are the step-3 GLiNER entity types (case-insensitive). Relations not
+# listed are unconstrained. SYMMETRIC relations also canonicalize direction.
+RELATION_TYPE_CONSTRAINTS: dict[str, tuple[Optional[set], Optional[set]]] = {
+    "founded by":       ({"organization"}, {"person", "organization"}),
+    "headquartered in": ({"organization", "product"}, {"location"}),
+    "located in":       ({"organization", "person"}, {"location"}),  # not products
+    "works for":        ({"person"}, {"organization"}),
+    "develops":         ({"organization"}, {"product", "service", "feature"}),
+    "offers":           ({"organization"}, {"product", "service", "feature"}),
+    "competes with":    ({"organization", "product"}, {"organization", "product"}),
+    "part of":          (None, None),
+    "uses":             (None, None),
+}
+SYMMETRIC_RELATIONS = {"competes with", "related to"}
+
+
+def _type_ok(relation: str, head_type: str, tail_type: str) -> bool:
+    """Does this triplet satisfy the relation's type constraints?"""
+    ht, tt = RELATION_TYPE_CONSTRAINTS.get(relation, (None, None))
+    h, t = (head_type or "").lower(), (tail_type or "").lower()
+    return (ht is None or h in ht) and (tt is None or t in tt)
 
 _glirel_model = None
 
@@ -119,14 +149,17 @@ def extract_relations(
     st = step_cm.__enter__() if step_cm is not None else None
 
     try:
-        # Group step-3 mentions per chunk
+        # Group step-3 mentions per chunk + id -> type for constraint checks
         mentions_by_chunk: dict[str, list[tuple[dict, dict]]] = {}
+        id_to_type: dict[str, str] = {}
         for e in entities:
+            id_to_type[e["id"]] = e.get("type", "")
             for m in e.get("mentions", []):
                 mentions_by_chunk.setdefault(str(m["chunk_id"]), []).append((e, m))
 
         triplets: dict[tuple, dict] = {}
         raw_count = 0
+        n_type_dropped = 0
 
         for c in chunks:
             chunk_id = str(c.get("chunk_id", ""))
@@ -177,24 +210,66 @@ def extract_relations(
                         st.drop({"entity_id": subj, "label": p.get("label"),
                                  "chunk_id": chunk_id}, "self-relation")
                     continue
-                key = (subj, str(p["label"]), obj, chunk_id)
-                if key not in triplets or triplets[key]["score"] < score:
+                relation = str(p["label"])
+                # Type constraint: the relation's head/tail entity types must
+                # match (kills "San Francisco founded-by Dario", wrong-direction
+                # "Dario founded-by Anthropic", "Claude located-in ...", etc.)
+                if not _type_ok(relation, id_to_type.get(subj, ""),
+                                id_to_type.get(obj, "")):
+                    n_type_dropped += 1
+                    if st is not None:
+                        st.drop({"triplet": (subj, relation, obj),
+                                 "head_type": id_to_type.get(subj),
+                                 "tail_type": id_to_type.get(obj)},
+                                "type constraint violated")
+                    continue
+                # Symmetric relations: canonicalize direction so A<->B is one edge.
+                if relation in SYMMETRIC_RELATIONS and subj > obj:
+                    subj, obj = obj, subj
+                # Dedup identical (subject, relation, object) ACROSS chunks into
+                # ONE edge with a support_count; keep best score, gather chunks.
+                key = (subj, relation, obj)
+                t = triplets.get(key)
+                if t is None:
                     triplets[key] = {
                         "subject_entity_id": subj,
-                        "relation": str(p["label"]),
+                        "relation": relation,
                         "object_entity_id": obj,
                         "source_chunk_id": chunk_id,
+                        "source_chunk_ids": [chunk_id],
+                        "support_count": 1,
                         "score": score,  # heuristic confidence
                     }
+                else:
+                    t["support_count"] += 1
+                    if chunk_id not in t["source_chunk_ids"]:
+                        t["source_chunk_ids"].append(chunk_id)
+                    t["score"] = max(t["score"], score)
 
-        out = sorted(triplets.values(), key=lambda t: -t["score"])
+        deduped = list(triplets.values())
+        # Precision floor: drop low-confidence edges (over-generation). An edge
+        # seen in >=2 chunks (corroborated) is kept one notch lower.
+        kept = []
+        for t in deduped:
+            floor = PRECISION_FLOOR - (0.1 if t["support_count"] >= 2 else 0.0)
+            if t["score"] >= floor:
+                kept.append(t)
+            elif st is not None:
+                st.drop({"triplet": (t["subject_entity_id"], t["relation"],
+                                     t["object_entity_id"]), "score": t["score"]},
+                        f"below precision floor {floor:.2f}")
+
+        out = sorted(kept, key=lambda t: -t["score"])
         logger.info(
-            f"GLiREL: {raw_count} raw predictions -> {len(out)} validated triplets "
-            f"(threshold={threshold}, heuristic scores)"
+            f"GLiREL: {raw_count} raw -> {n_type_dropped} type-violations dropped "
+            f"-> {len(deduped)} deduped -> {len(out)} kept "
+            f"(precision_floor={PRECISION_FLOOR}, heuristic scores)"
         )
         if st is not None:
             st.outputs["triplets"] = out
             st.outputs["n_raw_predictions"] = raw_count
+            st.outputs["n_type_dropped"] = n_type_dropped
+            st.outputs["n_deduped"] = len(deduped)
             st.scores["n_triplets"] = float(len(out))  # heuristic
         return out
     except BaseException as exc:

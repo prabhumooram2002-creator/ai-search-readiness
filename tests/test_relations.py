@@ -124,3 +124,94 @@ def test_trace_step_appended_even_on_model_error(monkeypatch):
         pass
     assert trace.step_names() == ["relation_extraction"]
     assert any("ERROR" in n for n in trace.steps[0].notes)
+
+
+def test_precision_floor_and_cross_chunk_dedup(monkeypatch):
+    # backlog: over-generation control. Two chunks each state the SAME
+    # (acme, founded by, jane-roe); a third weak/nonsense edge is below floor.
+    ents2 = [
+        _entity("acme", "Acme", "Organization", "c0", 0, 4),
+        _entity("jane-roe", "Jane Roe", "Person", "c0", 20, 28),
+        _entity("berlin", "Berlin", "Location", "c0", 32, 38),
+    ]
+    # add mentions of acme/jane in a second chunk c1 so dedup can corroborate
+    for e in ents2:
+        e["mentions"].append({"chunk_id": "c1", "char_start": e["mentions"][0]["char_start"],
+                              "char_end": e["mentions"][0]["char_end"], "score": 0.9})
+
+    def preds_for(tokens, labels, threshold=0.5, ner=None, top_k=-1):
+        # same strong founded-by in both chunks (0.9), plus one TYPE-VALID but
+        # weak edge (Acme[org] located-in Berlin[location] @0.4) -> below floor
+        return [
+            {"head_pos": [0, 1], "tail_pos": [4, 6], "head_text": ["Acme"],
+             "tail_text": ["Jane", "Roe"], "label": "founded by", "score": 0.90},
+            {"head_pos": [0, 1], "tail_pos": [7, 8], "head_text": ["Acme"],
+             "tail_text": ["Berlin."], "label": "located in", "score": 0.40},  # weak
+        ]
+    fake = FakeGlirel([]); fake.predict_relations = preds_for
+    monkeypatch.setattr(rel, "_get_glirel", lambda: fake)
+
+    chunks = [{"content": TEXT, "chunk_id": "c0"}, {"content": TEXT, "chunk_id": "c1"}]
+    trace = Trace(query="q")
+    out = rel.extract_relations(chunks, ents2, trace=trace)
+
+    fb = [t for t in out if t["relation"] == "founded by"]
+    assert len(fb) == 1                              # deduped across c0 + c1
+    assert fb[0]["support_count"] == 2
+    assert set(fb[0]["source_chunk_ids"]) == {"c0", "c1"}
+    # the weak located-in edge (0.40, type-valid) is below the floor -> dropped
+    assert all(t["relation"] != "located in" for t in out)
+    assert any("below precision floor" in d["reason"] for d in trace.steps[0].dropped)
+    assert trace.steps[0].outputs["n_type_dropped"] == 0   # both were type-valid
+    assert trace.steps[0].outputs["n_deduped"] >= len(out)
+
+
+def test_type_constraints_kill_wrong_direction_and_type(monkeypatch):
+    # entities with types: org, person, location
+    ents = [
+        _entity("acme", "Acme", "Organization", "c0", 0, 4),
+        _entity("jane-roe", "Jane Roe", "Person", "c0", 20, 28),
+        _entity("berlin", "Berlin", "Location", "c0", 32, 38),
+    ]
+    def preds_for(tokens, labels, threshold=0.5, ner=None, top_k=-1):
+        return [
+            # correct: Acme(org) founded by Jane(person) -> KEPT
+            {"head_pos": [0, 1], "tail_pos": [4, 6], "label": "founded by", "score": 0.9},
+            # wrong direction: Jane(person) founded by Acme(org) -> type violation
+            {"head_pos": [4, 5], "tail_pos": [0, 1], "label": "founded by", "score": 0.9},
+            # nonsense: Berlin(location) founded by Jane(person) -> type violation
+            {"head_pos": [7, 8], "tail_pos": [4, 6], "label": "founded by", "score": 0.9},
+            # correct: Acme(org) located in Berlin(location) -> KEPT
+            {"head_pos": [0, 1], "tail_pos": [7, 8], "label": "located in", "score": 0.9},
+            # nonsense: Acme(org) located in Jane(person) -> tail not Location
+            {"head_pos": [0, 1], "tail_pos": [4, 6], "label": "located in", "score": 0.9},
+        ]
+    fake = FakeGlirel([]); fake.predict_relations = preds_for
+    monkeypatch.setattr(rel, "_get_glirel", lambda: fake)
+
+    trace = Trace(query="q")
+    out = rel.extract_relations([CHUNK], ents, trace=trace)
+    got = {(t["subject_entity_id"], t["relation"], t["object_entity_id"]) for t in out}
+    assert got == {("acme", "founded by", "jane-roe"),
+                   ("acme", "located in", "berlin")}     # only the 2 valid ones
+    assert trace.steps[0].outputs["n_type_dropped"] == 3
+    assert any("type constraint" in d["reason"] for d in trace.steps[0].dropped)
+
+
+def test_symmetric_relation_canonicalized(monkeypatch):
+    ents = [_entity("claude", "Claude", "Product", "c0", 0, 6),
+            _entity("gemini", "Gemini", "Product", "c0", 20, 26)]
+    def preds_for(tokens, labels, threshold=0.5, ner=None, top_k=-1):
+        # both directions of a symmetric relation -> collapse to one edge
+        return [
+            {"head_pos": [0, 1], "tail_pos": [4, 5], "label": "competes with", "score": 0.8},
+            {"head_pos": [4, 5], "tail_pos": [0, 1], "label": "competes with", "score": 0.7},
+        ]
+    fake = FakeGlirel([]); fake.predict_relations = preds_for
+    # both entities need >=2-token presence; map token 0->claude, 4->gemini
+    ents[1]["mentions"][0]["char_start"] = 20; ents[1]["mentions"][0]["char_end"] = 26
+    monkeypatch.setattr(rel, "_get_glirel", lambda: fake)
+    out = rel.extract_relations([{"content": "Claude and also the Gemini model here.",
+                                  "chunk_id": "c0"}], ents)
+    comp = [t for t in out if t["relation"] == "competes with"]
+    assert len(comp) == 1 and comp[0]["support_count"] == 2   # A<->B merged

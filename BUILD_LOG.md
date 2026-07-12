@@ -875,3 +875,41 @@ local zero-key default preserved. Suite: 108 passed, 1 skipped.
 Remaining = v3 BACKLOG only: node2vec, Common Crawl backlinks, GLiREL
 over-generation floor, rerank recall benchmark, topic-noise at full corpus
 scale, competitor comparison, legacy src.main tracing.
+
+---
+
+## BACKLOG #3 — GLiREL over-generation control (2026-07-12)
+
+**Problem (measured):** GLiREL emitted 84 raw predictions from one 3-sentence
+chunk -> 60 triplets, full of high-scoring nonsense
+("San Francisco founded-by Dario Amodei" 0.87, wrong-direction "Dario
+founded-by Anthropic", every entity pair as bidirectional "competes with").
+
+**Built (`src/relations.py`):**
+1. Cross-chunk dedup: identical (subject, relation, object) merge into ONE edge
+   with support_count + source_chunk_ids (was keyed per-chunk).
+2. Precision floor (env GLIREL_PRECISION_FLOOR, default 0.6); corroborated
+   edges (support>=2) kept one notch lower.
+3. **Type constraints** (RELATION_TYPE_CONSTRAINTS): each relation's head/tail
+   entity types must match the step-3 GLiNER types (founded-by: Org->Person/Org;
+   located-in: Org/Person->Location; competes-with: Org/Product<->Org/Product;
+   ...). Symmetric relations canonicalize direction (A<->B = one edge).
+
+**Measured impact (live, same rich chunk):**
+```
+floor alone:            84 raw -> 60 -> 46 kept  (-23%; nonsense survived)
++ type constraints:     84 raw -> 25 type-violations -> 23 deduped -> 22 kept (-74%)
+```
+ALL blatant errors eliminated: "SF founded-by Dario", wrong-direction
+founded-by, product-founded-by-person, product-located-in all gone; the one
+surviving founded-by is CORRECT (anthropic -> dario-amodei), and
+"anthropic located-in san-francisco" is correct.
+
+**HONEST precision note:** type constraints remove the *clearly* wrong edges,
+but "competes with" is still over-generated (GLiREL emits it for most Org/Product
+pairs in a competitive context — ~18 of the 22 survivors are plausible-but-not-
+all-stated). A rigorous precision>=0.8 on 30 hand-labeled triplets is NOT
+claimed — that needs manual labeling. Residual "competes with" noise is
+filtered downstream by Layer-2 NLI evidence validation at query time (original
+design). Tests: test_relations.py 8 passed (incl. type-constraint kill of
+wrong-direction/type + symmetric canonicalization + floor + cross-chunk dedup).
