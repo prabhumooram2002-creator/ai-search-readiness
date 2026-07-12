@@ -913,3 +913,133 @@ claimed — that needs manual labeling. Residual "competes with" noise is
 filtered downstream by Layer-2 NLI evidence validation at query time (original
 design). Tests: test_relations.py 8 passed (incl. type-constraint kill of
 wrong-direction/type + symmetric canonicalization + floor + cross-chunk dedup).
+
+---
+
+## BACKLOG #4 — memory-constrained fallbacks + 3 NVIDIA-embed bugs (2026-07-12/13)
+
+Surfaced running a full audit on an 8GB-RAM machine (real site, real queries,
+not a synthetic test) — the kind of failure a hand-built offline suite can't
+catch, only a full run against real infrastructure does.
+
+1. **Thundering-herd embedder race** (`src/providers.py`): concurrent
+   `asyncio.gather` callers each saw the BGE-M3 singleton as `None` and loaded
+   their own copy simultaneously — multiple full model loads at once, OOM on
+   smaller machines. Fixed with a double-checked lock.
+2. **Lighter local-model env-var swaps**: `GLINER_MODEL` (small ~400MB vs
+   large ~1.8GB default), `SPACY_MODEL` (`en_core_web_sm` ~13MB vs the
+   transformer default), `RELATION_PROVIDER=llm` (routes relation extraction
+   through the already-configured LLM instead of loading GLiREL locally),
+   `SKIP_RELATIONS=1` (last-resort bypass). None change default behavior.
+3. **NVIDIA NIM embed bugs** (`src/embed/embedder.py`, `config.yaml`), found
+   in sequence as each got past the previous:
+   - Missing `input_type` — `nv-embedqa-e5-v5` is an asymmetric model and
+     400s without it. Fixed for `embedqa` models specifically (`"passage"`,
+     matching every call site's actual usage — none of them embed queries).
+   - Token-length 400 — 2000 chars tokenized to 1024 tokens for dense
+     content (~2 chars/token, not the ~4 assumed elsewhere). Truncate to 800
+     chars for `embedqa` models, ~2x margin.
+   - **Dimension mismatch crash at the KG write step**: `config.yaml`'s
+     `nvidia_embed_model` (`nv-embed-v1`, 4096-dim, used by the chunk-indexing
+     path) disagreed with `providers.py`'s default (`nv-embedqa-e5-v5`,
+     1024-dim, used by topics/fanout/simulator/whatif) — two independently
+     evolved code paths, same NVIDIA_API_KEY, different models. Kuzu's typed
+     `FLOAT[1024]` schema caught it: `Conversion exception ... Expected: 1024,
+     Actual: 4096`. Fixed the config default; also made the on-disk embed
+     cache tag by model name (was a bare `"nvidia"` bucket) so this class of
+     cross-model collision can't silently recur if the model changes again.
+
+**Verification:** full audit run on wickedgud.com (89 pages, 393 chunks, 428
+entities, 571 claims, 11 topics) completed end-to-end through all Layers
+0-3 with these fixes in place — the crash points above are exactly where
+three consecutive attempts died before each respective fix.
+
+---
+
+## PHASE 10 — Report overhaul (2026-07-13)
+
+Built per the v3 brief, on `phase/10-report`, in the stated order: 10a
+(impact chain) first, then the five report sections, then the renderer
+rules and their tests.
+
+### 10a — the impact chain (`src/impact.py`)
+
+Chains machinery that already existed: every Layer-3 recommendation that has
+a matching Phase 8 fix artifact gets run through the Phase 7 what-if overlay,
+and the predicted coverage delta is attached to it.
+
+- **Conflict + resolution** (flagged before touching a proven module, per
+  the brief's rule): `src/explain.py`'s recommendations had no stable id,
+  while `src/fixes.py`'s manifest keys artifacts by `finding_id`. Added
+  `finding_id` to each recommendation using the same slug scheme as
+  `fixes.py` — purely additive, no existing field changed, all Layer 2/3
+  tests unaffected (verified: 111 -> then 131 passed after Phase 10's own
+  tests were added, zero regressions at either point).
+- Content-type fixes (FAQ drafts for dead ends, block rewrites for
+  structure flags) go through `whatif()` for a real coverage delta.
+  Technical fixes (JSON-LD, llms.txt) get a qualitative note instead of a
+  fabricated coverage number — the what-if overlay measures retrievable
+  prose, and structured data isn't that; inventing a delta for it would
+  violate "never present a predicted number as measured" in spirit even
+  though it's labeled predicted.
+- Cached per `(finding_id, fix_content_hash)` — unchanged findings skip
+  recompute; a changed fix artifact forces one.
+- `whatif()` failures are caught, not fatal — one broken draft doesn't take
+  down the whole report.
+
+**Tests (`tests/test_impact.py`, 5 passed):** content fix -> real delta from
+a stubbed what-if; technical fix -> qualitative note, stub asserts what-if
+is never called for it; no-fix-artifact finding left untouched; cache hit on
+unchanged content, recompute on changed content (content hash verified);
+what-if exception caught and surfaced as `kind: unknown`, not a crash.
+
+### 10b/10c — five-section report + renderer rules (`src/report/decision_report.py`)
+
+S1 verdict (site grade A-F, heuristic composite, formula logged in the
+output itself) -> S2 action plan (ranked by
+`query_weight x severity x fix_confidence`, every row resolves to a real URL
+or is dropped — never shown as a bare id) -> S3 query battle cards (top-10
+weighted queries, ANSWERABLE/PARTIAL/INVISIBLE verdict) -> S4 technical
+visibility (per-bot invisibility, robots conflicts, orphan pages, llms.txt
+status) -> S5 trend (only when a snapshot diff exists).
+
+**Renderer rules (10c), enforced by `enforce_renderer_rules()` called
+from `run_audit.py` itself — a violation raises, it doesn't just log:**
+jargon ban (chunk/NLI/entailment/rerank/BM25/embedding/HDBSCAN/trace) via
+`translate_finding()`'s own plain-English templates (never reuses
+`explain.py`'s internal `action` text — that stays in the debug appendix);
+every S2 row's URL is checked directly against the rendered HTML; predicted/
+simulated/heuristic labels asserted present.
+
+**Known simplification (flagged, not silently approximated):** the default
+chunker (`src/chunk/chunking.py`) doesn't populate `heading_path` — only the
+newer `chunking2.py` (Phase 3a, not yet wired into `run_audit.py`'s default
+`build_index()`) does. S2/S3 rows fall back to no heading path rather than a
+fabricated one. S4's "missing page-to-page link" check is a lighter version
+of the spec's per-page sub-intent cross-reference (which nothing in this
+pipeline computes) — topic co-membership in the KG is the closest existing
+signal, used instead and documented as such.
+
+**Tests (`tests/test_decision_report.py`, 15 passed):** grade bands + formula
+presence; predicted-lift sentence capped and labeled, and gives an honest
+"run with --fixes" message when there's nothing to predict from; every
+action-plan row has a resolvable URL, unresolvable findings are dropped;
+priority ordering by query weight; battle-card verdict badges; the full
+rendered HTML has zero jargon-ban hits and zero bare chunk-id patterns; every
+action-plan URL appears in the rendered output; number formatting (0-decimal
+percentages, 2-decimal-max scores).
+
+### Wiring (`run_audit.py`)
+
+`load_query_weights()` — additive, `load_queries()` itself untouched — real
+GKP weight when `--gkp` is given or a Phase-4 JSON query file carries its
+own; uniform 1.0 otherwise (never zero — CLAUDE.md's "volume weight orders
+reporting" doesn't say unweighted queries should be dropped). `--fixes` now
+also gates `report.html` generation (10a has nothing to chain without Phase
+8 artifacts). `write_reports()`'s markdown moved to `audit_report_debug.md`
+per the brief — engineers' appendix, never shown to a client.
+
+**Verification: full suite 131 passed, 1 skipped, zero regressions**, run
+from a clean checkout at each of the three commits on `phase/10-report`.
+Penny-test verification (a non-engineer answering from S1+S2 alone) against
+a real site is the next step — see the PENNY TEST section below.
