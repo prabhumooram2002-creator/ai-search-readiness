@@ -480,17 +480,12 @@ async def step_run_semantic_repair(
         if file_path and os.path.exists(file_path):
             parsed = parse_file(file_path)
         else:
-            parsed = [
-                NormalizedQuery(
-                    original=q, canonical=q, intent="informational",
-                    detected_entities=[], source="hermes",
-                )
-                for q in [
-                    "healthy alternatives for fitness freaks",
-                    "the noodles with protein for gym freaks",
-                    "best pasta for weight loss",
-                ]
-            ]
+            # No brand-specific query defaults: queries must be supplied explicitly
+            # via a --queries file or the `queries` argument.
+            raise ValueError(
+                "No queries provided: pass a queries file path or an explicit "
+                "list of queries. Hardcoded brand defaults were removed in Layer -1."
+            )
     else:
         parsed = [
             NormalizedQuery(

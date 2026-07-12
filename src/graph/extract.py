@@ -1,11 +1,14 @@
-"""Entity and relationship extraction from chunks using LLM.
-   
-   Schema: Section 5 of the spec.
-   Provider: NVIDIA NIM chat (free), DeepSeek fallback.
-   Caches by chunk content hash — re-runs don't re-spend API calls.
+"""Entity and relationship extraction from chunks using an LLM.
+
+   Provider: LOCAL Ollama by default (via ``providers.llm_complete`` — zero keys,
+   routes on LLM_PROVIDER). NVIDIA NIM / DeepSeek remain optional fallbacks that
+   only engage when a key is configured and the local path fails.
+   Caches by chunk content hash — re-runs don't re-extract.
+   Entity/relationship label sets are domain-agnostic (no brand coupling).
 """
 import json
 import hashlib
+import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 import httpx
@@ -13,6 +16,7 @@ import httpx
 from ..core.config import (
     NVIDIA_API_KEY, NVIDIA_API_KEY_2, DEEPSEEK_API_KEY,
 )
+from .. import providers
 from ..core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -20,23 +24,24 @@ logger = get_logger(__name__)
 NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEEPSEEK_CHAT_URL = "https://api.deepseek.com/v1/chat/completions"
 
+# Domain-agnostic label sets (no brand/vertical coupling). Override per project
+# by editing these lists; the extractor passes them into the prompt.
 ENTITY_TYPES = [
-    "Product", "Brand", "Ingredient", "Benefit", "Disease", "HealthCondition",
-    "Nutrient", "Audience", "Category", "Topic", "FAQ", "Organization",
-    "Location", "Claim", "Attribute"
+    "Person", "Organization", "Product", "Service", "Feature", "Technology",
+    "Topic", "Concept", "Location", "Attribute", "Date", "Price",
 ]
 
 RELATIONSHIP_TYPES = [
-    "contains", "madeFrom", "supports", "belongsTo", "treats",
-    "recommendedFor", "partOf", "relatedTo"
+    "relatedTo", "partOf", "hasFeature", "offeredBy", "locatedIn",
+    "contains", "supports", "comparesTo", "uses", "targets",
 ]
 
-EXTRACTION_PROMPT = """You are an entity extraction system for a health/wellness website audit.
+EXTRACTION_PROMPT = """You are a domain-agnostic entity and relationship extraction system for a website content audit.
 
 Extract entities and relationships from the content below. Follow the schema exactly.
 
 ENTITY SCHEMA:
-- id: string (lowercase slug of entity name, e.g. "vitamin-c", "collagen-cream")
+- id: string (lowercase slug of entity name, e.g. "acme-corp", "api-gateway")
 - type: one of: {entity_types}
 - name: string (human-readable name)
 - synonyms: list of alternate names/variations
@@ -49,21 +54,14 @@ RELATIONSHIP SCHEMA:
 - evidence_chunk_id: string (the chunk ID containing the evidence)
 - confidence: float 0-1
 
-IMPORTANT RULES:
-- Only extract entities genuinely mentioned in the content
-- Only extract relationships clearly supported by the text
-- id must be unique and stable (use lowercase slug)
-- confidence = how certain you are the relationship is correct (0.5 minimum, 1.0 for very clear)
-- Use only the provided relationship types
-- source_chunk_ids should reference the chunk_id provided
-- At least ONE entity is required per extraction — if content has no clear entities, still return empty relationships
-- Be conservative: only extract confident relationships
-
-NUTRITION TABLE RULES (CRITICAL):
-- If the content contains a nutrition facts table or ingredient panel, extract EVERY row as a distinct Nutrient entity
-- Do NOT skip Carbohydrates, Total Fat, Saturated Fat, Trans Fat, Sodium, Sugar, added Sugar, Dietary Fibre, Protein, Energy/Calories — extract ALL of them
-- Each nutrient gets its own entity with type "Nutrient" and its value as a synonym (e.g. name="Total Carbohydrates", synonyms=["10g"])
-- Also extract an "Attribute" entity if the product makes a specific nutrient claim (e.g. "High Protein", "Low Sugar", "No Maida")
+RULES:
+- Only extract entities genuinely mentioned in the content.
+- Only extract relationships clearly supported by the text.
+- id must be a unique, stable lowercase slug.
+- confidence >= 0.5; use 1.0 only for very clear relationships.
+- Use only the provided entity and relationship types.
+- source_chunk_ids should reference the provided chunk_id.
+- If the content has no clear entities, return empty lists (do not invent).
 
 Return ONLY valid JSON in this exact format (no markdown, no explanation):
 {{
@@ -165,6 +163,29 @@ async def _deepseek_extract(
         return resp.json()["choices"][0]["message"]["content"]
 
 
+async def _local_extract(
+    messages: list[dict],
+    max_tokens: int = 2048,
+    temperature: float = 0.1,
+) -> str:
+    """Extract via the LOCAL LLM (Ollama) through the provider abstraction.
+
+    Routes on LLM_PROVIDER (default ``ollama``) and requires no API key, so the
+    knowledge graph builds fully offline. ``providers.llm_complete`` is sync, so
+    we run it in the default executor to avoid blocking the event loop.
+    """
+    system = next((m["content"] for m in messages if m.get("role") == "system"), None)
+    user = next((m["content"] for m in messages if m.get("role") == "user"), "")
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: providers.llm_complete(
+            user, system=system, json=True,
+            temperature=temperature, max_tokens=max_tokens,
+        ),
+    )
+
+
 def _parse_extraction(raw: str) -> dict:
     """Parse LLM JSON output, stripping markdown code blocks."""
     text = raw.strip()
@@ -261,20 +282,26 @@ async def extract_from_chunks(
             {"role": "user", "content": prompt_content},
         ]
         
-        # Try NVIDIA first, then DeepSeek fallback
+        # LOCAL-FIRST: Ollama via providers.llm_complete (zero keys, default).
+        # NVIDIA/DeepSeek engage only if a key is configured and local fails.
         raw = None
-        for provider in ["nvidia", "deepseek"]:
-            try:
-                if provider == "nvidia" and NVIDIA_API_KEY:
-                    raw = await _nvidia_extract(messages)
-                    break
-                elif provider == "deepseek" and DEEPSEEK_API_KEY:
-                    raw = await _deepseek_extract(messages)
-                    break
-            except Exception as e:
-                logger.warning(f"Extraction provider {provider} failed: {e}")
-                continue
-        else:
+        try:
+            raw = await _local_extract(messages)
+        except Exception as e:
+            logger.warning(f"Local extraction failed: {e}; trying cloud fallback if keys present")
+            for provider in ["nvidia", "deepseek"]:
+                try:
+                    if provider == "nvidia" and NVIDIA_API_KEY:
+                        raw = await _nvidia_extract(messages)
+                        break
+                    elif provider == "deepseek" and DEEPSEEK_API_KEY:
+                        raw = await _deepseek_extract(messages)
+                        break
+                except Exception as e2:
+                    logger.warning(f"Extraction provider {provider} failed: {e2}")
+                    continue
+
+        if raw is None:
             logger.error(f"All extraction providers failed for batch {i//batch_size + 1}")
             continue
         

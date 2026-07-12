@@ -40,9 +40,10 @@ class HermesStore:
     idempotent retries are safe.
     """
 
-    _local = threading.local()
-
     def __init__(self, db_path: str = "data/hermes.db"):
+        # Per-instance so distinct stores never share a connection (a class-level
+        # threading.local leaked the first-opened connection across instances).
+        self._local = threading.local()
         self.db_path = str(Path(db_path).resolve())
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
@@ -59,6 +60,17 @@ class HermesStore:
             conn.execute("PRAGMA busy_timeout=5000")
             self._local.connection = conn
             return conn
+
+    def close(self) -> None:
+        """Close this thread's SQLite connection so the file handle is released.
+
+        Windows refuses to unlink an open DB file, so tests (and any caller that
+        wants to delete the DB) must call this first. Safe to call repeatedly.
+        """
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            conn.close()
+            del self._local.connection
 
     @contextmanager
     def tx(self) -> Generator[sqlite3.Connection, None, None]:

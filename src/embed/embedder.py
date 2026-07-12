@@ -23,8 +23,21 @@ DEEPSEEK_EMBED_URL = "https://api.deepseek.com/v1/embeddings"
 GOOGLE_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # ─── Cache ────────────────────────────────────────────────────────────────────
+def _embed_tag() -> str:
+    """Model-aware cache namespace so different embedding models (different
+    dims) never collide in the on-disk cache. Previously this collapsed all
+    NVIDIA models to a single "nvidia" tag, which silently mixed nv-embed-v1
+    (4096-dim) and nv-embedqa-e5-v5 (1024-dim) results and broke the Kuzu
+    FLOAT[1024] schema ("Conversion exception ... Expected: 1024, Actual:
+    4096") once both code paths got exercised in the same run."""
+    from .. import providers
+    if providers._resolve_embed_provider() == "local":
+        return providers.EMBED_MODEL.replace("/", "_")
+    nvidia_model = embed_cfg().get("nvidia_embed_model", "nvidia/nv-embed-v1")
+    return f"nvidia_{nvidia_model.replace('/', '_')}"
+
 def _cache_path(content_hash: str) -> str:
-    return str(CACHE_DIR / f"{content_hash}.json")
+    return str(CACHE_DIR / f"{_embed_tag()}__{content_hash}.json")
 
 def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:32]
@@ -57,6 +70,14 @@ async def _nvidia_embed_with_retry(texts: list[str], model: str = "nvidia/nv-emb
     keys = [k for k in [NVIDIA_API_KEY, NVIDIA_API_KEY_2] if k]
     last_exc = None
 
+    # nv-embedqa-* NIM models hard-cap input at 512 tokens; callers upstream
+    # (topics.py etc.) truncate by character count for other providers, which
+    # isn't tight enough — a real 400 showed 2000 chars tokenizing to 1024
+    # tokens (~2 chars/token for this content), not the ~4 chars/token
+    # assumed elsewhere. 800 chars keeps ~2x margin under the 512 cap even
+    # at that density.
+    embed_max_chars = 800 if "embedqa" in model else MAX_CHARS
+
     for attempt in range(4):  # 4 attempts total
         for key_i, key in enumerate(keys):
             headers = {
@@ -64,10 +85,16 @@ async def _nvidia_embed_with_retry(texts: list[str], model: str = "nvidia/nv-emb
                 "Content-Type": "application/json",
             }
             payload = {
-                "input": [_truncate(t) for t in texts],
+                "input": [_truncate(t, embed_max_chars) for t in texts],
                 "model": model,
                 "encoding_format": "float",
             }
+            # Asymmetric NIM embedding models (e.g. nv-embedqa-*) require
+            # input_type ("query" or "passage") or the API 400s. Every call
+            # site in this codebase embeds document/chunk content, not user
+            # queries, so "passage" is correct here.
+            if "embedqa" in model:
+                payload["input_type"] = "passage"
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     resp = await client.post(NVIDIA_EMBED_URL, headers=headers, json=payload)
@@ -192,7 +219,12 @@ async def embed_chunks(chunk_texts: list[str], use_cache: bool = True) -> list[l
 
     # ── Phase 2: batch all uncached into API calls via asyncio.gather ──────
     async def call_provider(texts: list[str]) -> list[list[float]]:
-        """Call all providers in priority order, return embeddings."""
+        """Route to the configured embed provider. Local BGE-M3 is the default
+        (no API key); nvidia/deepseek/google only when EMBED_PROVIDER selects them."""
+        from .. import providers
+        if providers._resolve_embed_provider() == "local":
+            # CPU-bound sentence-transformers call — run off the event loop.
+            return await asyncio.to_thread(providers.embed_texts, texts)
         last_exc = None
         for provider in provider_priority:
             try:

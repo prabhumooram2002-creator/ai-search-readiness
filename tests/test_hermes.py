@@ -1,319 +1,222 @@
 """
-Hermes integration test — full workflow lifecycle.
+Hermes integration tests -- workflow lifecycle over the durable SQLite store.
 
-Tests:
-1. Creating a scan returns immediately with workflow_id
-2. Scanning status of an empty project
-3. Cancelling a scan
-4. Event recording
-5. Running the full pipeline on existing data
-6. Producing recommendations
+Covers:
+1. Workflow creation, status, events, cancellation
+2. Retry / failure escalation
+3. Event + artifact recording
+4. Idempotency (unknown scan -> empty)
+5. (opt-in) full worker pipeline end-to-end
+
+Each test runs against its own throwaway DB and closes the store in a finally,
+so the SQLite file handle is released before the temp dir is removed (Windows
+will not unlink an open DB file).
 """
 
 import asyncio
-import json
 import os
+import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
 
 # Ensure project root on path
 BASE = Path(__file__).resolve().parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
 
-from src.orchestrator import create_api
-
-# Use a temporary DB for tests
-TEST_DB = str(BASE / "data" / "test_hermes.db")
+from src.optional.hermes import create_api
 
 
-def cleanup():
-    db = Path(TEST_DB)
-    if db.exists():
-        db.unlink()
+@contextmanager
+def temp_api():
+    """Yield a HermesAPI backed by a fresh temp DB; close + delete on exit."""
+    tmpdir = tempfile.mkdtemp(prefix="hermes_test_")
+    api = create_api(str(Path(tmpdir) / "test_hermes.db"))
+    try:
+        yield api
+    finally:
+        api.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def test_basic_lifecycle():
-    """Test workflow creation, status, events, and cancellation."""
-    cleanup()
-    api = create_api(TEST_DB)
+    """Workflow creation, status, events, and cancellation."""
+    with temp_api() as api:
+        scan = api.create_scan(
+            project_id="test_proj",
+            target_url="https://example.com",
+            queries=["test query"],
+        )
+        assert "workflow_id" in scan
+        assert "scan_id" in scan
+        assert scan["status"] == "created"
+        scan_id = scan["scan_id"]
 
-    # 1. Create a scan
-    scan = api.create_scan(
-        project_id="test_proj",
-        target_url="https://example.com",
-        queries=["test query"],
-    )
-    assert "workflow_id" in scan
-    assert "scan_id" in scan
-    assert scan["status"] == "created"
-    scan_id = scan["scan_id"]
-    print(f"[OK] Scan created: {scan_id} / {scan['workflow_id']}")
+        status = api.get_scan_status(scan_id)
+        assert status is not None
+        assert status["status"] == "created"
+        steps = status["steps"]
+        assert len(steps) == 12  # 12 workflow steps
+        assert "crawl_pages" in steps
+        assert "finalize_scan" in steps
 
-    # 2. Get status
-    status = api.get_scan_status(scan_id)
-    assert status is not None
-    assert status["status"] == "created"
-    steps = status["steps"]
-    assert len(steps) == 12  # 12 workflow steps
-    assert "crawl_pages" in steps
-    assert "finalize_scan" in steps
-    print(f"[OK] Scan status retrieved: {len(steps)} steps defined")
+        started = api.start_scan(scan_id)
+        assert started["status"] == "running"
 
-    # 3. Start the scan
-    started = api.start_scan(scan_id)
-    assert started["status"] == "running"
-    print(f"[OK] Scan started")
+        cancelled = api.cancel_scan(scan_id)
+        assert cancelled["status"] == "cancelled"
 
-    # 4. Cancel the scan
-    cancelled = api.cancel_scan(scan_id)
-    assert cancelled["status"] == "cancelled"
-    print(f"[OK] Scan cancelled")
+        events = api.get_events(scan_id)
+        assert len(events) >= 2
+        event_types = [e["type"] for e in events]
+        assert "workflow.created" in event_types
+        assert "workflow.started" in event_types
+        assert "workflow.cancelled" in event_types
 
-    # 5. Events recorded
-    events = api.get_events(scan_id)
-    assert len(events) >= 2  # created + started + cancelled
-    event_types = [e["type"] for e in events]
-    assert "workflow.created" in event_types
-    assert "workflow.started" in event_types
-    assert "workflow.cancelled" in event_types
-    print(f"[OK] {len(events)} events recorded")
-
-    # 6. No artifacts on cancelled scan
-    arts = api.get_artifacts(scan_id)
-    assert len(arts) == 0
-    print(f"[OK] No orphan artifacts")
-
-    cleanup()
-    print("\n✅ test_basic_lifecycle PASSED")
+        arts = api.get_artifacts(scan_id)
+        assert len(arts) == 0
 
 
 def test_retry_flow():
-    """Test creating a failed workflow and retrying it."""
-    cleanup()
-    api = create_api(TEST_DB)
+    """A failed step auto-retries, then escalates to failed; workflow can retry."""
+    from src.optional.hermes.models import WorkflowStatus, StepStatus
 
-    scan = api.create_scan(
-        project_id="test_proj",
-        target_url="https://example.com",
-    )
-    scan_id = scan["scan_id"]
-    wf_id = scan["workflow_id"]
+    with temp_api() as api:
+        scan = api.create_scan(
+            project_id="test_proj",
+            target_url="https://example.com",
+        )
+        scan_id = scan["scan_id"]
+        wf_id = scan["workflow_id"]
 
-    # Manually simulate a step failure to test retry logic
-    from src.orchestrator.models import WorkflowStatus, StepStatus
+        api.engine.start_workflow(wf_id)
+        first_step = api.store.get_workflow_steps(wf_id)[0]
 
-    api.engine.start_workflow(wf_id)
+        api.engine.mark_step_running(first_step.id)
+        result = asyncio.run(api.engine.fail_step(first_step.id, {
+            "class": "transient", "message": "Network timeout",
+        }))
+        assert result.status == StepStatus.ready  # retried
 
-    # Get the first step
-    steps = api.store.get_workflow_steps(wf_id)
-    first_step = steps[0]
+        api.engine.mark_step_running(first_step.id)
+        asyncio.run(api.engine.fail_step(first_step.id, {
+            "class": "transient", "message": "Network timeout again",
+        }))
+        api.engine.mark_step_running(first_step.id)
+        result = asyncio.run(api.engine.fail_step(first_step.id, {
+            "class": "fatal", "message": "Corrupted data",
+        }))
+        assert result.status == StepStatus.failed
 
-    # Mark it as failed
-    api.engine.mark_step_running(first_step.id)
-    result = asyncio.run(api.engine.fail_step(first_step.id, {
-        "class": "transient",
-        "message": "Network timeout",
-    }))
-    assert result.status == StepStatus.ready  # retried
-    print(f"[OK] Step auto-retried (status={result.status.value})")
+        wf = api.store.get_workflow(wf_id)
+        assert wf.status == WorkflowStatus.failed
 
-    # Make it fail again until exhausted
-    api.engine.mark_step_running(first_step.id)
-    result = asyncio.run(api.engine.fail_step(first_step.id, {
-        "class": "transient",
-        "message": "Network timeout again",
-    }))
-    api.engine.mark_step_running(first_step.id)
-    result = asyncio.run(api.engine.fail_step(first_step.id, {
-        "class": "fatal",
-        "message": "Corrupted data",
-    }))
-    assert result.status == StepStatus.failed
-    print(f"[OK] Step finally failed after retries exhausted")
-
-    # Workflow should be failed
-    wf = api.store.get_workflow(wf_id)
-    assert wf.status == WorkflowStatus.failed
-    print(f"[OK] Workflow marked failed")
-
-    # Retry from failed step
-    retried = api.retry_scan(scan_id)
-    assert retried["status"] == "running"
-    print(f"[OK] Workflow retried from failed step")
-
-    cleanup()
-    print("\n✅ test_retry_flow PASSED")
+        retried = api.retry_scan(scan_id)
+        assert retried["status"] == "running"
 
 
 def test_events_and_artifacts():
-    """Test event recording and artifact lifecycle."""
-    cleanup()
-    api = create_api(TEST_DB)
+    """Events and artifacts are recorded and read back correctly."""
+    from src.optional.hermes.models import Artifact
 
-    scan = api.create_scan(
-        project_id="test_proj",
-        target_url="https://example.com",
-        metadata={"test": True},
-    )
-    scan_id = scan["scan_id"]
-    wf_id = scan["workflow_id"]
+    with temp_api() as api:
+        scan = api.create_scan(
+            project_id="test_proj",
+            target_url="https://example.com",
+            metadata={"test": True},
+        )
+        scan_id = scan["scan_id"]
+        wf_id = scan["workflow_id"]
 
-    # Emit events directly
-    api.store.emit_event(wf_id, scan_id, "workflow.step.progress",
-                         message="Test event", progress_percent=50.0,
-                         step_name="test_step")
+        api.store.emit_event(wf_id, scan_id, "workflow.step.progress",
+                             message="Test event", progress_percent=50.0,
+                             step_name="test_step")
 
-    # Verify events
-    events = api.get_events(scan_id)
-    assert len(events) >= 1
-    latest = events[-1]
-    assert latest["type"] == "workflow.step.progress"
-    assert latest["message"] == "Test event"
-    assert latest["progress_percent"] == 50.0
-    print(f"[OK] Events recorded correctly")
+        events = api.get_events(scan_id)
+        assert len(events) >= 1
+        latest = events[-1]
+        assert latest["type"] == "workflow.step.progress"
+        assert latest["message"] == "Test event"
+        assert latest["progress_percent"] == 50.0
 
-    # Create an artifact
-    from src.orchestrator.models import Artifact
-    art = Artifact(
-        id="art_test_1", workflow_id=wf_id,
-        step_name="test_step", name="test_artifact",
-        type="test", storage_path="/tmp/test.json",
-        size_bytes=100,
-    )
-    api.store.add_artifact(art)
+        art = Artifact(
+            id="art_test_1", workflow_id=wf_id,
+            step_name="test_step", name="test_artifact",
+            type="test", storage_path="/tmp/test.json",
+            size_bytes=100,
+        )
+        api.store.add_artifact(art)
 
-    arts = api.get_artifacts(scan_id)
-    assert len(arts) == 1
-    assert arts[0]["name"] == "test_artifact"
-    print(f"[OK] Artifacts recorded correctly")
-
-    cleanup()
-    print("\n✅ test_events_and_artifacts PASSED")
+        arts = api.get_artifacts(scan_id)
+        assert len(arts) == 1
+        assert arts[0]["name"] == "test_artifact"
 
 
 def test_idempotency():
-    """Test that creating the same workflow twice doesn't duplicate state."""
-    cleanup()
-    api = create_api(TEST_DB)
-
-    # Same scan_id should not be duplicated
-    arts_before = api.get_artifacts("nonexistent")
-    assert len(arts_before) == 0
-    print(f"[OK] Non-existent scan returns empty artifacts")
-
-    cleanup()
-    print("\n✅ test_idempotency PASSED")
+    """Unknown scan returns empty artifacts (no phantom state)."""
+    with temp_api() as api:
+        arts_before = api.get_artifacts("nonexistent")
+        assert len(arts_before) == 0
 
 
-def test_full_pipeline_on_existing_data():
+@pytest.mark.skipif(
+    os.getenv("HERMES_RUN_PIPELINE") != "1",
+    reason="Heavy end-to-end pipeline (real crawl/embed/LLM). "
+           "Set HERMES_RUN_PIPELINE=1 to run.",
+)
+def test_full_pipeline_end_to_end():
+    """Opt-in: start the worker and run the 12-step pipeline to completion.
+
+    Queries are generic and caller-supplied (no brand-specific defaults -- those
+    were removed in Layer -1). Tolerates timeout by cancelling and returning.
     """
-    Run the full Hermes pipeline end-to-end using existing WickedGud data.
-    This test:
-    1. Creates a scan with queries
-    2. Starts the worker
-    3. Waits for completion (or timeout)
-    4. Verifies recommendations exist
-    """
-    cleanup()
-    api = create_api(TEST_DB)
-
-    # Use queries that match our existing crawl data
-    scan = api.create_scan(
-        project_id="wickedgud",
-        target_url="https://wickedgud.com",
-        queries=[
-            "healthy alternatives for fitness freaks",
-            "the noodles with protein for gym freaks",
-            "best pasta for weight loss",
-        ],
-        max_pages=50,
-    )
-    scan_id = scan["scan_id"]
-    print(f"\n[TEST] Created scan: {scan_id}")
-    print(f"[TEST] Workflow: {scan['workflow_id']}")
-
-    # Start the worker and the workflow
-    api.start_scan(scan_id)
-    api.start_worker()
-
-    # Poll for completion (max 60 seconds)
     import time
-    deadline = time.time() + 60
-    final_status = None
-    while time.time() < deadline:
-        status = api.get_scan_status(scan_id)
-        if status["status"] in ("completed", "failed", "cancelled"):
-            final_status = status
-            break
-        print(f"[TEST] Status: {status['status']} ({status['progress_percent']:.0f}%) "
-              f"step={status['current_step']}")
-        time.sleep(2)
 
-    api.stop_worker()
+    with temp_api() as api:
+        scan = api.create_scan(
+            project_id="demo",
+            target_url="https://example.com",
+            queries=[
+                "what is this website about",
+                "what does this page offer",
+            ],
+            max_pages=5,
+        )
+        scan_id = scan["scan_id"]
 
-    if final_status is None:
-        print(f"[WARN] Timeout -- stopping test. "
-              f"Last status: {api.get_scan_status(scan_id)['status']}")
-        api.cancel_scan(scan_id)
-        cleanup()
-        return
+        api.start_scan(scan_id)
+        api.start_worker()
 
-    print(f"\n[TEST] Final status: {final_status['status']}")
-    print(f"[TEST] Progress: {final_status['progress_percent']:.0f}%")
+        deadline = time.time() + 120
+        final_status = None
+        while time.time() < deadline:
+            status = api.get_scan_status(scan_id)
+            if status["status"] in ("completed", "failed", "cancelled"):
+                final_status = status
+                break
+            time.sleep(2)
 
-    # Show step statuses
-    for step_name, s in final_status["steps"].items():
-        marker = "[OK]" if s["status"] == "succeeded" else \
-                 "[FAIL]" if s["status"] == "failed" else \
-                 "[SKIP]" if s["status"] == "skipped" else \
-                 "[...]"
-        print(f"  {marker} {step_name}: {s['status']}")
+        api.stop_worker()
 
-    # Get recommendations
-    recs = api.get_recommendations(scan_id)
-    if recs:
-        print(f"\n[OK] {len(recs)} recommendations generated")
-        for r in recs[:3]:
-            print(f"  [{r['priority']}] {r['type']}: {r['title'][:80]}")
+        if final_status is None:
+            api.cancel_scan(scan_id)
+            pytest.skip("pipeline did not finish within the deadline")
 
-        # Type assertions
-        assert len(recs) > 0, "Expected at least 1 recommendation"
+        recs = api.get_recommendations(scan_id)
         for r in recs:
-            assert "type" in r
-            assert "title" in r
-            assert "priority" in r
-    else:
-        print(f"\n[WARN] No recommendations generated (steps may have been skipped)")
-
-    # Show events
-    events = api.get_events(scan_id, limit=20)
-    print(f"\n[TEST] {len(events)} events recorded")
-
-    # Get model usage
-    usage = api.get_model_usage(scan_id)
-    if usage:
-        print(f"[TEST] {len(usage)} model usage records")
-    else:
-        print(f"[TEST] No model usage records")
-
-    cleanup()
-    print("\n✅ test_full_pipeline_on_existing_data PASSED")
+            assert "type" in r and "title" in r and "priority" in r
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  HERMES ORCHESTRATION TESTS")
-    print("=" * 60)
-    print()
-
-    test_basic_lifecycle()
-    test_retry_flow()
-    test_events_and_artifacts()
-    test_idempotency()
-    test_full_pipeline_on_existing_data()
-
-    print("\n" + "=" * 60)
-    print("  ALL TESTS PASSED")
-    print("=" * 60)
+    # Direct run: exercise everything including the opt-in pipeline test.
+    os.environ.setdefault("HERMES_RUN_PIPELINE", "1")
+    test_basic_lifecycle();            print("[PASS] basic_lifecycle")
+    test_retry_flow();                 print("[PASS] retry_flow")
+    test_events_and_artifacts();       print("[PASS] events_and_artifacts")
+    test_idempotency();                print("[PASS] idempotency")
+    test_full_pipeline_end_to_end();   print("[PASS] full_pipeline_end_to_end")
+    print("ALL HERMES TESTS PASSED")
