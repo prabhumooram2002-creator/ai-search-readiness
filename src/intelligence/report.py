@@ -9,8 +9,8 @@ import json as _json
 from pathlib import Path
 
 from . import (backlinks, chunks_intel, citation_readiness, content_intel,
-              crawl_intel, crawlability, entities as entities_mod, keywords,
-              kg_quality, query_sim, reasoning_path, recommendations,
+              core_utils, crawl_intel, crawlability, entities as entities_mod,
+              keywords, kg_quality, query_sim, reasoning_path, recommendations,
               relationships, topics_intel, trust)
 from .. import claim_intel, identity as identity_mod
 
@@ -166,8 +166,11 @@ def build_intelligence_report(
     all_recs = [r for e in explanations for r in e.get("recommendations", [])]
     causal_chains = recommendations.build_causal_chains(all_recs)
 
+    ref_index = core_utils.build_ref_index(chunks, ents["all"])
+
     return {
         "url": ctx["site_report"]["url"],
+        "_ref_index": ref_index,
         "section_1_identity": identity_report,
         "section_2_entities": ents,
         "section_3_relationships": {"triplets": triplets, "findings": rel_findings,

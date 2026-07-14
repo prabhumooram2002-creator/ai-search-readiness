@@ -4,8 +4,11 @@ over row text, no external library), works offline from disk."""
 from __future__ import annotations
 
 import json as _json
+import re as _re
 
 from .core_utils import esc, pct, score2
+
+_ID_COL_RE = _re.compile(r"(^id$|_id$)", _re.IGNORECASE)
 
 SECTION_TITLES = [
     ("section_1_identity", "1. Website Identity"),
@@ -61,45 +64,107 @@ def _kv_table(rows: list[tuple[str, str]]) -> str:
         f"<tr><td>{esc(k)}</td><td>{v}</td></tr>" for k, v in rows) + "</table>"
 
 
-def _list_table(items: list[dict], columns: list[str]) -> str:
+def _resolve_source(item: dict, id_cols: list[str], ref_index: dict) -> str:
+    """Turns a row's id field(s) into a link to the page URL + a text
+    snippet, per the brief's hard rule that a bare chunk/entity id is a
+    build failure. Falls back to an explicit, honest note (never a raw id)
+    when no page can be resolved -- e.g. a fully orphaned entity."""
+    url = item.get("url") or item.get("page_url")
+    snippet = item.get("snippet")
+    # chunk-level ids resolve to the actual source text; prefer them over
+    # entity ids, which only resolve to *a* page the entity happens to
+    # appear on.
+    ordered_cols = sorted(id_cols, key=lambda c: 0 if "chunk" in c.lower() else 1)
+    for col in ordered_cols:
+        raw = item.get(col)
+        if raw is None:
+            continue
+        ref = ref_index.get(raw)
+        if ref:
+            url = url or ref.get("url")
+            snippet = snippet or ref.get("snippet")
+    if url:
+        label = esc(snippet) if snippet else "view source"
+        return f'<a href="{esc(url)}" target="_blank" rel="noopener">{label}</a>'
+    return "<span class='note'>heuristic: no linked page (orphan reference)</span>"
+
+
+def _sanitize_nested(value, ref_index: dict):
+    """A cell value that is itself a list/dict (e.g. section 13's per-query
+    'retrieved'/'reranked' arrays) still gets naively stringified for
+    display -- walk it and swap any id-like key's raw value for its
+    resolved page URL, so a nested chunk_id can't leak into the report as
+    a bare id either."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if _ID_COL_RE.search(k):
+                ref = ref_index.get(v)
+                out[k] = (ref.get("url") if ref else None) or "unresolved"
+            else:
+                out[k] = _sanitize_nested(v, ref_index)
+        return out
+    if isinstance(value, list):
+        return [_sanitize_nested(v, ref_index) for v in value]
+    return value
+
+
+def _list_table(items: list[dict], columns: list[str], ref_index: dict | None = None) -> str:
+    ref_index = ref_index or {}
     if not items:
         return "<p class='note'>No rows.</p>"
-    head = "".join(f"<th>{esc(c)}</th>" for c in columns)
+    id_cols = [c for c in columns if _ID_COL_RE.search(c)]
+    display_cols = [c for c in columns if c not in id_cols][:6]
+    head = "".join(f"<th>{esc(c)}</th>" for c in display_cols)
+    if id_cols:
+        head += "<th>source</th>"
     body = ""
     for item in items:
-        cells = "".join(f"<td>{esc(item.get(c, ''))[:200]}</td>" for c in columns)
+        cells = ""
+        for c in display_cols:
+            v = item.get(c, "")
+            if isinstance(v, (list, dict)):
+                v = _sanitize_nested(v, ref_index)
+            cells += f"<td>{esc(v)[:200]}</td>"
+        if id_cols:
+            cells += f"<td>{_resolve_source(item, id_cols, ref_index)}</td>"
         body += f"<tr>{cells}</tr>"
     return f"<table><tr>{head}</tr>{body}</table>"
 
 
-def render_section(key: str, data) -> str:
+def render_section(key: str, data, ref_index: dict | None = None) -> str:
     """Generic fallback renderer: pretty-prints whatever a section returned.
     Section-specific layouts can be added incrementally without changing
     the overall assembly — every section is guaranteed a working row even
     before a bespoke renderer exists for it."""
+    ref_index = ref_index or {}
     if isinstance(data, list):
         if data and isinstance(data[0], dict):
-            cols = list(data[0].keys())[:6]
-            return _list_table(data, cols)
+            cols = list(data[0].keys())
+            return _list_table(data, cols, ref_index)
         return "<pre>" + esc(_json.dumps(data, indent=2, default=str)[:5000]) + "</pre>"
     if isinstance(data, dict):
         rows = []
         for k, v in data.items():
             if isinstance(v, (list, dict)):
                 continue
-            rows.append((k, esc(v)))
+            if _ID_COL_RE.search(k):
+                rows.append((k, _resolve_source({k: v}, [k], ref_index)))
+            else:
+                rows.append((k, esc(v)))
         extra = "".join(
-            f"<h4>{esc(k)}</h4>" + render_section(k, v)
+            f"<h4>{esc(k)}</h4>" + render_section(k, v, ref_index)
             for k, v in data.items() if isinstance(v, (list, dict)))
         return _kv_table(rows) + extra
     return f"<p>{esc(data)}</p>"
 
 
 def render_intelligence_html(payload: dict) -> str:
+    ref_index = payload.get("_ref_index") or {}
     nav = "".join(f'<a href="#{key}">{esc(title)}</a>' for key, title in SECTION_TITLES)
     body = ""
     for key, title in SECTION_TITLES:
-        body += f'<h2 id="{key}">{esc(title)}</h2>' + render_section(key, payload.get(key))
+        body += f'<h2 id="{key}">{esc(title)}</h2>' + render_section(key, payload.get(key), ref_index)
 
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Website Intelligence — {esc(payload.get('url', ''))}</title>

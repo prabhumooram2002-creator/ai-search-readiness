@@ -33,6 +33,27 @@ def excluded(reason: str) -> dict:
     return {"available": False, "reason": reason}
 
 
+def build_ref_index(chunks: list[dict], entities: list[dict] | None = None) -> dict[str, dict]:
+    """Maps chunk_id/entity_id -> {url, snippet} so the HTML renderer can turn
+    every bare id a section emits into a link + snippet instead of printing
+    the opaque id itself (the brief's hard rule: bare chunk/entity ids in the
+    rendered report are a build failure)."""
+    idx: dict[str, dict] = {}
+    for c in chunks:
+        cid = c.get("chunk_id")
+        if cid is None:
+            continue
+        content = (c.get("content") or "").strip().replace("\n", " ")
+        idx[cid] = {"url": c.get("url"), "snippet": content[:160]}
+    for e in (entities or []):
+        eid = e.get("id")
+        if eid is None:
+            continue
+        url = next((m.get("url") for m in e.get("mentions", []) if m.get("url")), None)
+        idx[eid] = {"url": url, "snippet": e.get("name", "")}
+    return idx
+
+
 def collapse_identical(rows: list[dict], key_fields: tuple[str, ...]) -> list[dict]:
     """'Repeated identical rows collapse into counts' (brief hard rule).
     Groups rows whose key_fields match, adding a 'count' field."""

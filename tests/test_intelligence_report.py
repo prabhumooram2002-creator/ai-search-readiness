@@ -28,7 +28,7 @@ class _FakeResult:
 # KG object can serve every section's differently-shaped query.
 _QUERY_ROWS = [
     ("OPTIONAL MATCH (e)<-[m:MentionsEntity]-(c:Chunk)",
-     [("e1", "Acme", "Organization", 0.9, "c1", "https://site.com/a")]),
+     [("e1", "Acme", "Organization", 0.9, "chunk-zzz1", "https://site.com/a")]),
     ("RelatesTo]->(b:Entity) RETURN a.id, b.id\n", []),  # graph_stats degree pass (entities.py)
     ("RETURN a.id, a.name, r.relation", []),  # relationships.relationship_triplets
     ("MATCH (a:Entity)-[:RelatesTo]->(b:Entity) RETURN a.id, b.id", []),
@@ -51,9 +51,9 @@ class _FakeKG:
 
 def _make_trace(query="noodles healthy?"):
     return Trace(query=query, answer="answer text", confidence=0.7,
-                retrieved=[{"chunk_id": "c1", "combined": 0.8}],
-                reranked=[{"chunk_id": "c1", "rerank": 1.0}],
-                citations=[{"page_url": "https://site.com/a", "chunk_id": "c1"}],
+                retrieved=[{"chunk_id": "chunk-zzz1", "combined": 0.8}],
+                reranked=[{"chunk_id": "chunk-zzz1", "rerank": 1.0}],
+                citations=[{"page_url": "https://site.com/a", "chunk_id": "chunk-zzz1"}],
                 evidence=[{"nli_label": "entailment", "nli_conf": 0.9}])
 
 
@@ -65,7 +65,7 @@ def test_build_intelligence_report_all_19_sections_present(monkeypatch):
         "kg": _FakeKG(),
         "l0_pages": [{"url": "https://site.com/a", "content": "Some page content.",
                      "internal_links": [], "schema_jsonld": [], "access_gaps": []}],
-        "chunks": [{"chunk_id": "c1", "content": "chunk text", "url": "https://site.com/a"}],
+        "chunks": [{"chunk_id": "chunk-zzz1", "content": "chunk text", "url": "https://site.com/a"}],
         "page_signals": {"https://site.com/a": {"source_authority": 0.5,
                                                 "temporal_freshness": 0.5}},
         "embeddings": [[1.0, 0.0]],
@@ -75,7 +75,7 @@ def test_build_intelligence_report_all_19_sections_present(monkeypatch):
     traces = [_make_trace()]
     explanations = [{"recommendations": [
         {"rule": "missing_entity", "finding_id": "entity:x", "action": "a"}]}]
-    struct = [{"chunk_id": "c1", "structure_score": 0.7, "flags": []}]
+    struct = [{"chunk_id": "chunk-zzz1", "structure_score": 0.7, "flags": []}]
 
     payload = rpt.build_intelligence_report(
         ctx, traces, explanations, struct, fx=None, query_weights={},
@@ -102,21 +102,21 @@ def test_claim_embedding_provider_outage_degrades_not_crashes(monkeypatch):
     class _KGWithOneClaim(_FakeKG):
         def _exec(self, query, params=None):
             if "SupportsClaim]->(cl:Claim)" in query:
-                return _FakeResult([("c1", "cl1", "Noodles cost Rs. 240.", "entailment", 0.9)])
+                return _FakeResult([("chunk-zzz1", "cl1", "Noodles cost Rs. 240.", "entailment", 0.9)])
             return super()._exec(query, params)
 
     ctx = {
         "kg": _KGWithOneClaim(),
         "l0_pages": [{"url": "https://site.com/a", "content": "text",
                      "internal_links": [], "schema_jsonld": [], "access_gaps": []}],
-        "chunks": [{"chunk_id": "c1", "content": "chunk", "url": "https://site.com/a"}],
+        "chunks": [{"chunk_id": "chunk-zzz1", "content": "chunk", "url": "https://site.com/a"}],
         "page_signals": {}, "embeddings": [[1.0, 0.0]],
         "site_report": {"url": "https://site.com", "sitemap": {}},
         "invisibility": {"worst_pages": []},
     }
     payload = rpt.build_intelligence_report(
         ctx, [_make_trace()], [{"recommendations": []}],
-        [{"chunk_id": "c1", "structure_score": 0.5, "flags": []}],
+        [{"chunk_id": "chunk-zzz1", "structure_score": 0.5, "flags": []}],
         fx=None, query_weights={}, skipped_queries=None)
 
     records = payload["section_11_12_claims"]["records"]
@@ -134,14 +134,14 @@ def test_render_intelligence_html_has_sidebar_and_search(monkeypatch):
         "kg": _FakeKG(),
         "l0_pages": [{"url": "https://site.com/a", "content": "text",
                      "internal_links": [], "schema_jsonld": [], "access_gaps": []}],
-        "chunks": [{"chunk_id": "c1", "content": "chunk", "url": "https://site.com/a"}],
+        "chunks": [{"chunk_id": "chunk-zzz1", "content": "chunk", "url": "https://site.com/a"}],
         "page_signals": {}, "embeddings": [[1.0, 0.0]],
         "site_report": {"url": "https://site.com", "sitemap": {}},
         "invisibility": {"worst_pages": []},
     }
     payload = rpt.build_intelligence_report(
         ctx, [_make_trace()], [{"recommendations": []}],
-        [{"chunk_id": "c1", "structure_score": 0.5, "flags": []}],
+        [{"chunk_id": "chunk-zzz1", "structure_score": 0.5, "flags": []}],
         fx=None, query_weights={}, skipped_queries=None)
     html = hr.render_intelligence_html(payload)
     assert 'id="searchbox"' in html
@@ -150,3 +150,43 @@ def test_render_intelligence_html_has_sidebar_and_search(monkeypatch):
     # 19 sections all got a heading
     for key, _ in hr.SECTION_TITLES:
         assert f'id="{key}"' in html
+
+
+def test_render_intelligence_html_never_prints_bare_ids(monkeypatch):
+    """Brief hard rule: 'bare chunk/entity ids are a build failure'. A row
+    with a chunk_id/entity_id must render as a link + snippet, never the
+    raw opaque id string, found via hand-verification against a real run
+    (section 3's relationship triplets rendered '042833ef040abf9f' as
+    plain text with no link)."""
+    from src import providers
+    monkeypatch.setattr(providers, "embed_texts", lambda texts: [[1.0, 0.0]] * len(texts))
+
+    class _KGWithTriplet(_FakeKG):
+        def _exec(self, query, params=None):
+            if "RETURN a.id, a.name, r.relation" in query:
+                return _FakeResult([("e1", "Acme", "founded by", "e9", "Dario",
+                                    0.9, "chunk-zzz1")])
+            return super()._exec(query, params)
+
+    ctx = {
+        "kg": _KGWithTriplet(),
+        "l0_pages": [{"url": "https://site.com/a", "content": "Some page content.",
+                     "internal_links": [], "schema_jsonld": [], "access_gaps": []}],
+        "chunks": [{"chunk_id": "chunk-zzz1", "content": "Acme was founded by Dario in 2020.",
+                   "url": "https://site.com/a"}],
+        "page_signals": {}, "embeddings": [[1.0, 0.0]],
+        "site_report": {"url": "https://site.com", "sitemap": {}},
+        "invisibility": {"worst_pages": []},
+    }
+    payload = rpt.build_intelligence_report(
+        ctx, [_make_trace()], [{"recommendations": []}],
+        [{"chunk_id": "chunk-zzz1", "structure_score": 0.5, "flags": []}],
+        fx=None, query_weights={}, skipped_queries=None)
+
+    assert payload["section_3_relationships"]["triplets"][0]["source_chunk_id"] == "chunk-zzz1"
+
+    html = hr.render_intelligence_html(payload)
+    assert "chunk-zzz1" not in html  # bare chunk id never appears in the rendered report
+    assert "e9" not in html  # bare entity id (object_id) never appears either
+    assert "Acme was founded by Dario" in html  # resolved snippet instead
+    assert 'href="https://site.com/a"' in html
