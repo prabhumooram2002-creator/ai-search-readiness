@@ -88,6 +88,45 @@ def test_build_intelligence_report_all_19_sections_present(monkeypatch):
     assert len(payload["section_14_reasoning_paths"]) == 1
 
 
+def test_claim_embedding_provider_outage_degrades_not_crashes(monkeypatch):
+    """Real bug found running the actual verification: an NVIDIA API 500
+    (surviving embedder.py's own 4-attempt retry) crashed the whole report.
+    build_intelligence_report() must catch that and degrade section 11/12
+    to 'no embedding available' rather than take down every other section."""
+    from src import providers
+
+    def failing_embed(texts):
+        raise RuntimeError("NVIDIA NIM embed failed after 4 attempts: 500")
+    monkeypatch.setattr(providers, "embed_texts", failing_embed)
+
+    class _KGWithOneClaim(_FakeKG):
+        def _exec(self, query, params=None):
+            if "SupportsClaim]->(cl:Claim)" in query:
+                return _FakeResult([("c1", "cl1", "Noodles cost Rs. 240.", "entailment", 0.9)])
+            return super()._exec(query, params)
+
+    ctx = {
+        "kg": _KGWithOneClaim(),
+        "l0_pages": [{"url": "https://site.com/a", "content": "text",
+                     "internal_links": [], "schema_jsonld": [], "access_gaps": []}],
+        "chunks": [{"chunk_id": "c1", "content": "chunk", "url": "https://site.com/a"}],
+        "page_signals": {}, "embeddings": [[1.0, 0.0]],
+        "site_report": {"url": "https://site.com", "sitemap": {}},
+        "invisibility": {"worst_pages": []},
+    }
+    payload = rpt.build_intelligence_report(
+        ctx, [_make_trace()], [{"recommendations": []}],
+        [{"chunk_id": "c1", "structure_score": 0.5, "flags": []}],
+        fx=None, query_weights={}, skipped_queries=None)
+
+    records = payload["section_11_12_claims"]["records"]
+    assert len(records) == 1
+    assert records[0]["note"] == "no embedding available"
+    # every other section still assembled despite the embedding failure
+    for key, _ in hr.SECTION_TITLES:
+        assert key in payload
+
+
 def test_render_intelligence_html_has_sidebar_and_search(monkeypatch):
     from src import providers
     monkeypatch.setattr(providers, "embed_texts", lambda texts: [[1.0, 0.0]] * len(texts))

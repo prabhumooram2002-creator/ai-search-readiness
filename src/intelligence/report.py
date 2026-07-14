@@ -100,11 +100,24 @@ def build_intelligence_report(
     # Section 11/12 — Claim Intelligence (site-wide, reuses the NLI model already loaded)
     from .. import providers
     from ..evidence import _score_pairs
+    from ..core.logging import get_logger as _get_logger
+    _logger = _get_logger(__name__)
     chunks_by_id = {c["chunk_id"]: c for c in chunks}
     chunk_embeddings = dict(zip((c["chunk_id"] for c in chunks), ctx["embeddings"]))
     claim_texts = [c["text"] for c in all_claims]
-    claim_vecs = providers.embed_texts([t[:512] for t in claim_texts]) if claim_texts else []
-    claim_embeddings = {c["id"]: v for c, v in zip(all_claims, claim_vecs)}
+    claim_embeddings: dict[str, list[float]] = {}
+    if claim_texts:
+        try:
+            claim_vecs = providers.embed_texts([t[:512] for t in claim_texts])
+            claim_embeddings = {c["id"]: v for c, v in zip(all_claims, claim_vecs)}
+        except Exception as exc:
+            # An external embedding-provider outage shouldn't crash the whole
+            # report -- cross_page_evidence() already degrades a claim with
+            # no embedding to an honest "no embedding available" note, so an
+            # empty dict here is enough; found via a real 500 from NVIDIA's
+            # API surviving embedder.py's own 4-attempt retry.
+            _logger.warning(f"[intelligence] claim embedding failed, section 11/12 "
+                           f"degraded to 'no embedding available' for all claims: {exc}")
     claim_records = claim_intel.cross_page_evidence(
         all_claims, chunks_by_id, claim_embeddings, chunk_embeddings, _score_pairs)
     claim_ranking = claim_intel.rank_claims(claim_records)
