@@ -488,7 +488,8 @@ def build_decision_report(ctx: dict, traces: list[Trace], explanations: list[dic
 
 def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
         fresh: bool, claims_cap: int = 25, mode: str = "full",
-        emit_fixes: bool = False, query_weights: dict[str, float] | None = None) -> dict:
+        emit_fixes: bool = False, query_weights: dict[str, float] | None = None,
+        emit_intelligence: bool = False) -> dict:
     from src.simulator import run_query
     from src.explain import explain_query
 
@@ -498,6 +499,15 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
         ctx = build_index_incremental(url, claims_cap)
     else:
         ctx = build_index(url, max_pages, fresh, claims_cap)
+
+    # Phase 12 P2 — query hygiene: dedupe + park off-brand/irrelevant queries
+    # against this run's own topic centroids (Section 13 lists them, never
+    # silently drops them).
+    from src.query_hygiene import clean_query_set
+    hygiene = clean_query_set(queries, kg=ctx["kg"], embed_fn=providers.embed_texts)
+    queries = hygiene["relevant"]
+    skipped_queries = hygiene["skipped"]
+
     traces, explanations = [], []
     for q in queries:
         t = run_query(q, ctx["chunks"], ctx["embeddings"], kg=ctx["kg"],
@@ -555,9 +565,27 @@ def run(url: str, queries: list[str], out_dir: Path, max_pages: int | None,
         report_html_path = build_decision_report(
             ctx, traces, explanations, struct, fx, query_weights or {}, out_dir)
 
+    # Phase 12 — the Website Intelligence Report (19 sections). Independent
+    # of --fixes (unlike Phase 10's report, it doesn't need fix artifacts to
+    # chain through), gated behind its own --intelligence flag since it adds
+    # real runtime (cross-page claim evidence re-scores every claim against
+    # its site-wide top-k chunks).
+    intelligence_html_path = None
+    if emit_intelligence:
+        from src.intelligence.report import build_intelligence_report
+        from src.intelligence.html_renderer import render_intelligence_html
+        payload = build_intelligence_report(
+            ctx, traces, explanations, struct, fx, query_weights or {}, skipped_queries)
+        (out_dir / "intelligence.json").write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        intelligence_html_path = out_dir / "intelligence.html"
+        intelligence_html_path.write_text(render_intelligence_html(payload), encoding="utf-8")
+        logger.info(f"[intelligence] wrote {intelligence_html_path}")
+
     return {"site_report": ctx["site_report"], "traces": traces,
             "explanations": explanations, "report_path": str(json_path),
-            "decision_report_path": str(report_html_path) if report_html_path else None}
+            "decision_report_path": str(report_html_path) if report_html_path else None,
+            "intelligence_report_path": str(intelligence_html_path) if intelligence_html_path else None}
 
 
 def cmd_import_queries(argv: list[str]) -> None:
@@ -738,6 +766,9 @@ def main() -> None:
     ap.add_argument("--gkp", help="Google Keyword Planner CSV — real query-volume "
                                   "weight for Phase 10's action-plan prioritization "
                                   "(optional; uniform weight 1.0 without it)")
+    ap.add_argument("--intelligence", action="store_true",
+                    help="Emit intelligence.html/.json (Phase 12) — the 19-section "
+                         "website knowledge-model report. Independent of --fixes.")
     args = ap.parse_args()
 
     # Phase 2 mode resolution: incremental is the default once a baseline
@@ -761,10 +792,13 @@ def main() -> None:
                 + (f" gkp={args.gkp}" if args.gkp else ""))
     result = run(args.url, queries, Path(args.out), args.max_pages,
                  fresh=not args.no_fresh, claims_cap=args.claims_cap, mode=mode,
-                 emit_fixes=args.fixes, query_weights=query_weights)
+                 emit_fixes=args.fixes, query_weights=query_weights,
+                 emit_intelligence=args.intelligence)
     print(f"\nReport written to {result['report_path']}")
     if result.get("decision_report_path"):
         print(f"Decision report (Phase 10): {result['decision_report_path']}")
+    if result.get("intelligence_report_path"):
+        print(f"Intelligence report (Phase 12): {result['intelligence_report_path']}")
 
 
 if __name__ == "__main__":
