@@ -363,7 +363,19 @@ def build_decision_report(ctx: dict, traces: list[Trace], explanations: list[dic
         enforce_renderer_rules)
     from src.snapshots import list_snapshots, load_snapshot, diff_snapshots
 
-    persist_paths = [str(BASE_DIR / "data" / "chromadb"), str(BASE_DIR / "data" / "kg.kuzu")]
+    # NOTE: deliberately NOT passing kg.kuzu (or chromadb) here as a
+    # persist_paths integrity check. That check hashes the file directly
+    # (whatif._hash_paths) to prove the overlay never wrote to it — a real
+    # safety net for the standalone `run_audit.py whatif` CLI command, where
+    # the DB is at rest. Here we're calling in-process while ctx["kg"]'s own
+    # KuzuDB connection is still open on that exact file, so a second raw
+    # read hits Kuzu's own file lock and fails every time with
+    # "[Errno 13] Permission denied" (100% reproducible, not the transient
+    # antivirus-scan case load_draft()'s retry handles) — found running the
+    # actual penny-test (BUILD_LOG PENNY TEST run #1). We already trust this
+    # code path not to persist (it's our own whatif() call, not a CLI
+    # invocation of unknown code), so the check adds no real safety here.
+    persist_paths: list[str] = []
     manifest = (fx or {}).get("manifest", [])
 
     # chunk_id -> {url, heading_path, text} — every S2/S3 row resolves through
