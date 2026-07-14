@@ -8,7 +8,20 @@ import re as _re
 
 from .core_utils import esc, pct, score2
 
-_ID_COL_RE = _re.compile(r"(^id$|_id$)", _re.IGNORECASE)
+_ID_COL_RE = _re.compile(r"(^id$|_id$|^chain_root$)", _re.IGNORECASE)
+# section 19's chain_root/finding_id values are prefixed composite keys, e.g.
+# "chunk:<hex_chunk_id>", "structure:<hex_chunk_id>", "entity:<name-slug>",
+# "deadend:<query-slug>", "unsupported:<sentence-slug>" (src/explain.py's
+# _chain_key/_slug). Only the first three name a real chunk/entity that
+# ref_index can resolve; the last two are already human-legible slugs of a
+# query/sentence, not opaque ids, so they're left as-is rather than flagged
+# as "unresolved".
+_REF_PREFIX_RE = _re.compile(r"^(chunk|structure|entity):(.+)$")
+
+
+def _strip_ref_prefix(raw: str) -> str:
+    m = _REF_PREFIX_RE.match(raw) if isinstance(raw, str) else None
+    return m.group(2) if m else raw
 
 SECTION_TITLES = [
     ("section_1_identity", "1. Website Identity"),
@@ -75,18 +88,32 @@ def _resolve_source(item: dict, id_cols: list[str], ref_index: dict) -> str:
     # entity ids, which only resolve to *a* page the entity happens to
     # appear on.
     ordered_cols = sorted(id_cols, key=lambda c: 0 if "chunk" in c.lower() else 1)
+    unresolved_ref = False
+    legible_fallback = None
     for col in ordered_cols:
         raw = item.get(col)
         if raw is None:
             continue
-        ref = ref_index.get(raw)
+        stripped = _strip_ref_prefix(raw)
+        ref = ref_index.get(stripped) or ref_index.get(raw)
         if ref:
             url = url or ref.get("url")
             snippet = snippet or ref.get("snippet")
+        elif isinstance(raw, str) and _REF_PREFIX_RE.match(raw):
+            unresolved_ref = True
+        elif isinstance(raw, str) and ":" in raw:
+            # not a chunk/entity reference at all (e.g. a query/sentence
+            # slug like "deadend:pricing-page") -- already human-legible,
+            # not an opaque id, so show it plainly rather than flag it.
+            legible_fallback = legible_fallback or raw.split(":", 1)[1].replace("-", " ")
     if url:
         label = esc(snippet) if snippet else "view source"
         return f'<a href="{esc(url)}" target="_blank" rel="noopener">{label}</a>'
-    return "<span class='note'>heuristic: no linked page (orphan reference)</span>"
+    if legible_fallback:
+        return f"<span class='note'>{esc(legible_fallback)}</span>"
+    if unresolved_ref:
+        return "<span class='note'>heuristic: no linked page (orphan reference)</span>"
+    return "<span class='note'>—</span>"
 
 
 def _sanitize_nested(value, ref_index: dict):
@@ -98,9 +125,19 @@ def _sanitize_nested(value, ref_index: dict):
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if _ID_COL_RE.search(k):
-                ref = ref_index.get(v)
-                out[k] = (ref.get("url") if ref else None) or "unresolved"
+            if _ID_COL_RE.search(k) and isinstance(v, str):
+                stripped = _strip_ref_prefix(v)
+                ref = ref_index.get(stripped) or ref_index.get(v)
+                if ref:
+                    out[k] = ref.get("url") or ref.get("snippet") or "unresolved"
+                elif _REF_PREFIX_RE.match(v):
+                    out[k] = "unresolved (orphan reference)"
+                elif ":" in v:
+                    out[k] = v.split(":", 1)[1].replace("-", " ")
+                else:
+                    out[k] = v
+            elif _ID_COL_RE.search(k):
+                out[k] = v
             else:
                 out[k] = _sanitize_nested(v, ref_index)
         return out

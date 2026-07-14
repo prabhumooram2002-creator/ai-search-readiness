@@ -190,3 +190,24 @@ def test_render_intelligence_html_never_prints_bare_ids(monkeypatch):
     assert "e9" not in html  # bare entity id (object_id) never appears either
     assert "Acme was founded by Dario" in html  # resolved snippet instead
     assert 'href="https://site.com/a"' in html
+
+
+def test_render_section_resolves_prefixed_composite_ids():
+    """Section 19's chain_root/finding_id values are prefixed composite keys
+    (src/explain.py's _chain_key: 'chunk:<hex_id>', 'structure:<hex_id>',
+    'entity:<name-slug>') -- found leaking a raw hex chunk id into the
+    rendered report on a real run because the column name 'chain_root'
+    doesn't match a plain '_id' suffix, and the id-lookup didn't strip the
+    prefix before checking ref_index."""
+    ref_index = {"deadbeefcafef00d": {"url": "https://site.com/blog/x",
+                                      "snippet": "the actual chunk text"}}
+    causal_chains = [{
+        "chain_root": "chunk:deadbeefcafef00d",
+        "steps": [{"rule": "weak_evidence", "action": "add citations",
+                  "finding_id": "structure:deadbeefcafef00d"}],
+        "n_steps": 1, "predicted_impact": None,
+    }]
+    html = hr.render_section("section_19_recommendations", causal_chains, ref_index)
+    assert "deadbeefcafef00d" not in html
+    assert 'href="https://site.com/blog/x"' in html
+    assert "the actual chunk text" in html

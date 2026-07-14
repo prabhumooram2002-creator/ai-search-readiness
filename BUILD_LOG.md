@@ -1088,3 +1088,206 @@ code change needed, the env var already existed
 in README's "Notes on the local model stack" table and the provider
 env-var reference table alongside the other three memory swaps. Deleted
 the now-unused 2.2GB `BAAI/bge-reranker-v2-m3` cache.
+
+---
+
+## Phase 12 — Website Intelligence Report (2026-07-14)
+
+Built per `INTELLIGENCE_REPORT_BRIEF.md`: a 19-section report reconstructing
+a site's "knowledge model" as the pipeline actually understood it — every
+heuristic labeled, simulated vs observed never conflated, every row
+resolved to a page URL + snippet (never a bare id), scores rounded to 2
+decimals, repeated identical rows collapsed into counts. Output:
+`intelligence.json` + a self-contained `intelligence.html` (sidebar nav,
+client-side substring search, no external CDN/JS, opens from disk).
+
+### PREREQ P1 — Relations:0 root cause
+
+The brief's own trigger: a prior run against wickedgud.com produced 428
+entities, 571 claims, but **zero** `RelatesTo` triplets — sections 3, 10,
+15 are meaningless without this. Root cause was **not** a GLiREL bug: an
+earlier memory-workaround session had set `SKIP_RELATIONS=1` in the
+environment (to dodge a large-model stall) and it was never unset. Fix:
+switch relation extraction to `RELATION_PROVIDER=llm` (already an existing
+env-var-gated code path in `src/relations.py`, just never selected).
+Verified twice: one run logged `LLM relations: 194 raw -> 90 deduped -> 90
+kept`; the final run used for hand-verification logged `154 kept`,
+matching `MATCH ()-[r:RelatesTo]->() RETURN count(r)` against the real
+`data/kg.kuzu` exactly.
+
+### PREREQ P2 — Query hygiene
+
+New `src/query_hygiene.py`: `dedupe_queries()`, `topic_centroids(kg)`
+(mean Chunk.embedding per topic via `BelongsToTopic`), cosine-based
+`score_query_relevance()`, and `clean_query_set()` which partitions the
+query list into `relevant` (fed to the simulator) and `skipped` (below the
+topic-similarity threshold, printed in section 13 as `"skipped
+(irrelevant)"` rather than silently run and scored). Wired into
+`run_audit.py` right after indexing. 8 tests, all pass.
+
+### PREREQ P3 — New deps
+
+Added `textstat>=0.7.3` (Flesch reading-ease for section 16); reused the
+already-installed `networkx` (PageRank, degree/component metrics) and
+`rapidfuzz` (`fuzz.token_set_ratio`, not `.ratio` — needed for "Acme" vs
+"Acme Inc" duplicate-entity matches to actually pass the threshold).
+
+### The 19 sections
+
+Built in the brief's specified order: pure-printing sections first
+(3 relationships, 5 chunks, 8 crawl, 9 crawlability, 13 query sim, 14
+reasoning path), then derived-stats sections over existing data (2
+entities, 4 topics, 10 KG quality, 16 content), then new modules
+(1 `src/identity.py`, 11/12 `src/claim_intel.py`, 17 trust, 6 keywords),
+then 15 (competitor, code-complete but not run against a live domain — no
+competitor URL was ever provided this session), then the 18/19 composites
+(citation readiness, recommendation engine). Final assembly in
+`src/intelligence/report.py` + `src/intelligence/html_renderer.py`, gated
+behind `run_audit.py --intelligence` independent of `--fixes`.
+
+Shared helpers factored into `src/intelligence/core_utils.py` (`cosine`,
+`pct`, `score2`, `esc`, `excluded(reason)`, `collapse_identical`,
+`build_ref_index`) and `src/intelligence/graph_stats.py` (`page_pagerank`,
+`orphan_pages`, `entity_relation_graph` — reuses the PageRank pattern from
+`src/layer0.py`'s AI Invisibility Score).
+
+58+ new tests across 11 test files (`test_intelligence_shared.py`,
+`test_intelligence_entities.py`, `test_identity.py`, `test_claim_intel.py`,
+`test_competitor.py`, `test_intelligence_sections_batch1/2/3.py`,
+`test_intelligence_report.py`).
+
+### Three real bugs found only by running the actual pipeline end-to-end
+(not caught by any unit test — all data-flow/schema issues, same pattern
+as the Phase 10 penny-test bugs above)
+
+1. **`RelatesTo` schema mismatch.** `relationships.py` queried
+   `r.support_count`, which `src/kg.py`'s schema never persists (only
+   `relation`, `score`, `source_chunk_id`) — crashed with `Binder
+   exception: Cannot find property support_count for r.`.
+   `src/relations.py` computes support_count in memory but the KG write
+   only sets score/source_chunk_id. Fixed by dropping support_count from
+   weak-edge detection (score floor alone); documented as a KNOWN GAP
+   (a real fix needs a KG schema change, out of scope for this pass).
+
+2. **NVIDIA embed 500 crashing the whole report.** `report.py`'s
+   claim-embedding call for sections 11/12 let an `httpx.HTTPStatusError`
+   (surviving `embedder.py`'s own 4-attempt retry) propagate straight out
+   of `build_intelligence_report()`, taking down all 19 sections over one
+   external API hiccup. Fixed with try/except: on failure,
+   `claim_embeddings` stays empty, which `cross_page_evidence()` already
+   handled gracefully (per-claim `"no embedding available"` note — that
+   code path pre-existed for other reasons). Recurred on the very next
+   real run and degraded correctly that time (logged a WARNING, report
+   completed).
+
+3. **entity_stats() undercounted entities with zero mentions (424 vs
+   428).** The query started `MATCH (e:Entity)<-[m:MentionsEntity]-(c:Chunk)`
+   — by Cypher semantics this is an inner join, so any Entity with zero
+   `MentionsEntity` edges is excluded no matter what `OPTIONAL MATCH` is
+   added downstream. Found via hand-verification: section 2's
+   `n_entities` (424) didn't match `MATCH (e:Entity) RETURN count(e)`
+   against the real KG (428). Diagnosed 3+ fully orphaned entities
+   (`rs-610`, `rs-940`, `masterful-masala-instant-noodles` — stale
+   `RelatesTo`/extraction artifacts with no live mention). Fixed by
+   restructuring to `MATCH (e:Entity)` with `OPTIONAL MATCH` on *both* the
+   `MentionsEntity` and `HasChunk`/`Page` hops, so an orphaned entity is
+   still counted (frequency 0) instead of silently dropped. Re-verified
+   directly against `data/kg.kuzu`: `entity_stats()` now reports exactly
+   428, matching the KG's real count. New regression tests in
+   `test_intelligence_entities.py` cover both the zero-mention-entity case
+   and the stale-HasChunk case.
+
+### A fourth bug found the same way — bare ids in the rendered HTML
+
+Hand-verifying section 3 against the rendered `intelligence.html` found
+`html_renderer.py`'s generic table fallback printing raw ids
+(e.g. `042833ef040abf9f`) as plain, unlinked table cells — a direct
+violation of the brief's hard rule ("bare chunk/entity ids are a build
+failure"). The renderer had no id-resolution logic at all; it just
+stringified whatever dict fields a section returned, including nested
+list/dict cells (section 13's per-query `retrieved`/`reranked` arrays leaked
+ids the same way one level down). Fixed:
+- `report.py` builds a `ref_index` once (`chunk_id`/`entity_id` ->
+  `{url, snippet}`) from the chunks and entities already in the payload,
+  stored under a private `_ref_index` payload key.
+- `html_renderer.py` now detects any column matching `(^id$|_id$)`
+  (case-insensitive) at any nesting depth, drops it from the visible
+  columns, and replaces it with a single resolved `<a href=url>snippet</a>`
+  link — chunk-level ids preferred over entity ids when both are present
+  on a row, since a chunk resolves to the actual source text. When nothing
+  resolves (a genuinely orphaned reference), it prints an explicit
+  `"heuristic: no linked page (orphan reference)"` note instead of the raw
+  id — same "document the gap, don't hide it" convention used everywhere
+  else in this codebase.
+- New regression test `test_render_intelligence_html_never_prints_bare_ids`
+  asserts the raw id string never appears anywhere in the rendered HTML
+  (top-level or nested) and that the resolved snippet/link does.
+
+### A fifth bug — the same class, one layer deeper (found on the corrected re-run)
+
+Re-verifying the *fixed* HTML against a fresh run still showed 50 bare hex
+chunk ids leaking through section 19 (Recommendation Engine): its
+`chain_root` field holds a **prefixed composite key** from
+`src/intelligence/recommendations.py`'s `_chain_key()` — e.g.
+`"chunk:042833ef040abf9f"`, `"structure:042833ef040abf9f"`, or
+`"entity:<name-slug>"` (mirroring `src/explain.py`'s `_slug()` scheme).
+Two compounding gaps: (1) the column name `chain_root` doesn't match the
+`_id$` suffix pattern, so it was never even flagged as an id column; (2)
+even the correctly-flagged nested `finding_id` field carried the *prefixed*
+string, which doesn't match a raw ref_index key. Fixed:
+- `_ID_COL_RE` now also matches the literal column name `chain_root`.
+- `_strip_ref_prefix()` strips a leading `chunk:`/`structure:`/`entity:`
+  before the ref_index lookup on both the top-level and nested paths.
+- `build_ref_index()` now also keys entities by a slug of their name (same
+  `_slug()` scheme as `src/explain.py`, kept in lockstep on purpose), so an
+  `"entity:<slug>"` finding_id resolves back to that entity's page too.
+- `"deadend:<query-slug>"` and `"unsupported:<sentence-slug>"` finding_ids
+  don't name a real chunk/entity at all (they're synthetic query/sentence
+  slugs) — rendered as their already-legible slug text instead of being
+  flagged as an unresolved reference, so the report doesn't cry "orphan"
+  over something that was never an opaque id in the first place.
+- New regression test `test_render_section_resolves_prefixed_composite_ids`.
+- Re-rendered `phase12_run_v2/intelligence.html` directly from its
+  `intelligence.json` (no pipeline re-run needed, since this class of fix
+  lives entirely in the renderer) and confirmed **zero** 16-hex-char id
+  occurrences anywhere in the 910KB output, down from 50.
+
+### Verification
+
+- Full suite: 201 passed, 1 skipped, zero regressions, after each of the
+  five bug fixes above.
+- Ran end-to-end against the real wickedgud.com data (89 pages, 393
+  chunks) with `run_audit.py --incremental --fixes --intelligence`,
+  producing `intelligence.html`/`intelligence.json`.
+- Hand-verified counts against the raw stores directly (not just against
+  the JSON, and not just once): section 2 `n_entities` (428) vs `MATCH
+  (e:Entity) RETURN count(e)`; section 3 triplet count (165) vs `MATCH
+  ()-[r:RelatesTo]->() RETURN count(r)`; section 5 chunk-dossier count
+  (393) vs `MATCH (c:Chunk) RETURN count(c)`; sections 16/18 page-row
+  counts (89) vs `MATCH (p:Page) RETURN count(p)`. All four matched
+  exactly on the final `phase12_run_v2` run.
+- A second, corrected end-to-end run (`phase12_run_v2`, incremental —
+  reuses the existing KG/vector store rather than re-crawling from
+  scratch) was executed after both the entity-count and bare-id fixes
+  landed, specifically to confirm the fixes hold on real generated output,
+  not just on unit-test fixtures.
+
+### Known, documented gaps (not silently worked around)
+
+- `RelatesTo.support_count` isn't in the KG schema (section 3's weak-edge
+  detection uses score alone).
+- Section 6 (keywords): GSC/GKP import code exists (`parse_gsc_csv`,
+  `keyword_cannibalization`, etc.) but no import was run this session — no
+  GSC export or GKP credentials were provided.
+- Section 7 (backlinks): degrades gracefully with an explicit note when
+  `ExternalDomain` is empty in the KG (no backlink data ingested).
+- Section 15 (competitor): code-complete and unit-tested standalone
+  (`src/intelligence/competitor.py`, 4 tests), but has a documented,
+  unfixed gap — `build_index()` takes a `kg_path` override but no matching
+  `VectorStore` `collection_name` override, so running it against a real
+  competitor domain today would overwrite the site's own Chroma
+  collection. Never executed against a live competitor this session (no
+  competitor URL was provided).
+- `heading_path` still isn't populated by the default chunker (pre-existing
+  gap from Phase 10), so section 5's "heading" context falls back to a
+  content snippet where a real heading isn't available.

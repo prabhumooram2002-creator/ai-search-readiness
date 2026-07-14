@@ -5,6 +5,16 @@ from __future__ import annotations
 
 import html as _html
 import math
+import re as _re
+
+_SLUG_RE = _re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str) -> str:
+    """Same scheme as src/explain.py's _slug (kept in lockstep) -- used here
+    only to key ref_index entries so a recommendation's 'entity:<slug>'
+    finding_id can resolve back to that entity's page, not just its raw id."""
+    return _SLUG_RE.sub("-", str(text).lower()).strip("-")[:40] or "fix"
 
 
 def cosine(a: list[float], b: list[float]) -> float:
@@ -50,7 +60,11 @@ def build_ref_index(chunks: list[dict], entities: list[dict] | None = None) -> d
         if eid is None:
             continue
         url = next((m.get("url") for m in e.get("mentions", []) if m.get("url")), None)
-        idx[eid] = {"url": url, "snippet": e.get("name", "")}
+        ref = {"url": url, "snippet": e.get("name", "")}
+        idx[eid] = ref
+        name = e.get("name")
+        if name:
+            idx.setdefault(_slug(name), ref)
     return idx
 
 
