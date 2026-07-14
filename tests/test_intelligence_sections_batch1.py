@@ -35,9 +35,12 @@ class _FakeKG:
 
 # ── Section 3 ────────────────────────────────────────────────────────────
 def test_relationship_triplets_and_weak_edge_finding():
-    kg = _FakeKG([("e1", "Acme", "founded by", "e2", "Dario", 1, 0.4)])
+    # row shape matches the real RelatesTo schema: relation, score,
+    # source_chunk_id -- no support_count (see relationships.py's KNOWN GAP)
+    kg = _FakeKG([("e1", "Acme", "founded by", "e2", "Dario", 0.4, "c1")])
     triplets = relationships.relationship_triplets(kg)
     assert triplets[0]["relation"] == "founded by"
+    assert triplets[0]["source_chunk_id"] == "c1"
     findings = relationships.relationship_findings(triplets)
     assert findings["n_weak"] == 1
     assert findings["missing_edges"]["available"] is False

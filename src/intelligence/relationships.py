@@ -1,8 +1,16 @@
 """Section 3 — Relationship Graph [EXISTS after P1]
 
-All subject-relation-object triplets with source chunk locations and
-support_count, plus derived quality findings and a dependency-free inline
-SVG graph of the top entities by importance (no external CDN).
+All subject-relation-object triplets with source chunk locations, plus
+derived quality findings and a dependency-free inline SVG graph of the top
+entities by importance (no external CDN).
+
+KNOWN GAP (found running the actual penny-test, not silently worked
+around): src/relations.py computes a support_count per triplet in memory
+(how many chunks corroborate the same edge), but src/kg.py's RelatesTo
+write only persists relation/score/source_chunk_id -- support_count never
+reaches the graph schema. Weak-edge detection below uses score alone; a
+real fix would add support_count to the KG schema (a proven-module change
+out of scope for this pass — see BUILD_LOG's Phase 12 note).
 """
 from __future__ import annotations
 
@@ -14,29 +22,28 @@ from .graph_stats import entity_relation_graph
 def relationship_triplets(kg) -> list[dict]:
     res = kg._exec(
         "MATCH (a:Entity)-[r:RelatesTo]->(b:Entity) "
-        "RETURN a.id, a.name, r.relation, b.id, b.name, r.support_count, r.score")
+        "RETURN a.id, a.name, r.relation, b.id, b.name, r.score, r.source_chunk_id")
     out = []
     while res.has_next():
-        aid, aname, rel, bid, bname, support, score = res.get_next()
+        aid, aname, rel, bid, bname, score, chunk_id = res.get_next()
         out.append({
             "subject_id": aid, "subject": aname, "relation": rel,
             "object_id": bid, "object": bname,
-            "support_count": support, "score": round(score, 2) if score is not None else None,
+            "score": round(score, 2) if score is not None else None,
+            "source_chunk_id": chunk_id,
         })
     return out
 
 
-def relationship_findings(triplets: list[dict], weak_support_floor: int = 1,
-                          weak_score_floor: float = 0.6) -> dict:
-    """Weak edges (support_count=1 and low confidence). Missing/unsupported-
+def relationship_findings(triplets: list[dict], weak_score_floor: float = 0.6) -> dict:
+    """Weak edges (score below floor -- support_count isn't available at
+    the KG level, see the module-level KNOWN GAP note). Missing/unsupported-
     claim-edge checks need fan-out sub-intents / claim-edge data this
     pipeline doesn't yet join at the KG level — printed as excluded rather
     than guessed (SupportsClaim is Chunk->Claim, not Entity->Entity, so
     there's no direct 'claim-edge' to check without a new join the brief
     doesn't specify the shape of)."""
-    weak = [t for t in triplets
-           if (t.get("support_count") or 0) <= weak_support_floor
-           and (t.get("score") or 1.0) < weak_score_floor]
+    weak = [t for t in triplets if (t.get("score") or 1.0) < weak_score_floor]
     return {
         "weak_edges": weak,
         "n_weak": len(weak),
