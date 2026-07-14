@@ -61,8 +61,27 @@ def test_verdict_predicted_lift_capped_and_labeled():
         top_action_deltas=[0.4, 0.3, 0.9])
     assert v["mean_weighted_coverage"] == 0.4
     assert "predicted, simulated" in v["predicted_lift_sentence"]
-    # lift is capped at 0.95 even though 0.4+0.4+0.3+0.9 would exceed 1.0
-    assert "95%" in v["predicted_lift_sentence"] or True  # cap enforced in compute, sanity only
+    # lift is capped at 1.0 (the true ceiling) even though 0.4+0.4+0.3+0.9 would exceed it
+    assert "100%" in v["predicted_lift_sentence"]
+
+
+def test_verdict_lift_never_below_starting_coverage():
+    """Real bug found running the actual penny-test: an old 0.95 sanity cap
+    produced "lift from 98% to 95%" whenever measured coverage already
+    exceeded 95% — a nonsensical negative "lift". The cap must never push
+    the predicted "after" number below the measured "before" number."""
+    v = dr.build_verdict(
+        invisibility={"site_invisibility": 0.02, "label": "measured", "headline": "2% invisible"},
+        queries=[{"weighted_coverage": 0.98}], mean_structure=0.8, mean_authority=0.8,
+        top_action_deltas=[0.1, 0.05])
+    assert v["mean_weighted_coverage"] == 0.98
+    assert "98%" in v["predicted_lift_sentence"]
+    assert "lift from 98% to 95%" not in v["predicted_lift_sentence"]
+    # "after" must be >= "before"
+    before = float(v["mean_weighted_coverage"])
+    import re as _re
+    after_pct = int(_re.search(r"to (\d+)%", v["predicted_lift_sentence"]).group(1))
+    assert after_pct >= round(before * 100)
 
 
 def test_verdict_no_fixes_run_gives_honest_message():

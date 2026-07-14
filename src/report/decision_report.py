@@ -146,7 +146,13 @@ def build_verdict(invisibility: dict, queries: list[dict], mean_structure: float
     mean_coverage = round(sum(covs) / len(covs), 4) if covs else 0.0
     grade = compute_site_grade(inv_score, mean_coverage, mean_structure, mean_authority)
 
-    lift = min(0.95, mean_coverage + sum(d for d in top_action_deltas if d and d > 0))
+    # Cap at 1.0 (the true ceiling) and never let the "after" number fall
+    # below the starting "before" — a real bug found running the actual
+    # penny-test: an artificial 0.95 sanity cap produced "lift from 98% to
+    # 95%" whenever measured coverage was already above 95%, an illogical
+    # negative "lift" that would mislead a reader worse than no cap at all.
+    lift = max(mean_coverage, min(1.0, mean_coverage + sum(
+        d for d in top_action_deltas if d and d > 0)))
     lift = round(lift, 4)
     return {
         "grade": grade,
