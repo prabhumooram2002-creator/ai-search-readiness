@@ -27,7 +27,7 @@ class _FakeResult:
 # Query -> canned rows, matched by a distinguishing substring so one fake
 # KG object can serve every section's differently-shaped query.
 _QUERY_ROWS = [
-    ("MentionsEntity)<-[m:MentionsEntity]-(c:Chunk)<-[:HasChunk]-(p:Page)",
+    ("OPTIONAL MATCH (e)<-[m:MentionsEntity]-(c:Chunk)",
      [("e1", "Acme", "Organization", 0.9, "c1", "https://site.com/a")]),
     ("RelatesTo]->(b:Entity) RETURN a.id, b.id\n", []),  # graph_stats degree pass (entities.py)
     ("RETURN a.id, a.name, r.relation", []),  # relationships.relationship_triplets

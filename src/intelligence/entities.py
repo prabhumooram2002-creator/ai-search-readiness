@@ -2,6 +2,20 @@
 
 Every stat here is computed from data the pipeline already stores (Entity,
 MentionsEntity, RelatesTo edges in the KG) — no new extraction.
+
+KNOWN GAP (found via hand-verification, not silently glossed over): this
+KG has a handful of Entity nodes with ZERO MentionsEntity edges at all —
+likely stale RelatesTo writes referencing an entity name that no longer
+has a live mention after incremental re-crawls (an existing-pipeline data-
+consistency issue, not introduced by this module). Starting the query FROM
+the MentionsEntity edge (as an INNER match) excludes such entities by
+construction — section_2's count came out 424 against the KG's real 428,
+tripping the brief's own rule ("every count in the report equals the
+KG/store count"). Fixed by starting from Entity itself, with OPTIONAL
+MATCH out to mentions/chunks/pages, so a fully-orphaned entity still
+appears (with frequency 0) instead of silently vanishing. This also
+independently needed OPTIONAL MATCH on the Chunk->Page hop, since some
+mentioned chunks separately have a stale/missing HasChunk link.
 """
 from __future__ import annotations
 
@@ -16,7 +30,9 @@ def entity_stats(kg, l0_pages: list[dict]) -> dict:
     pr = page_pagerank(l0_pages)
 
     res = kg._exec(
-        "MATCH (e:Entity)<-[m:MentionsEntity]-(c:Chunk)<-[:HasChunk]-(p:Page) "
+        "MATCH (e:Entity) "
+        "OPTIONAL MATCH (e)<-[m:MentionsEntity]-(c:Chunk) "
+        "OPTIONAL MATCH (p:Page)-[:HasChunk]->(c) "
         "RETURN e.id, e.name, e.type, m.score, c.id, p.url")
     by_entity: dict[str, dict] = {}
     while res.has_next():
@@ -25,8 +41,10 @@ def entity_stats(kg, l0_pages: list[dict]) -> dict:
             "id": eid, "name": name, "type": etype,
             "mentions": [], "pages": set(), "scores": [],
         })
-        e["mentions"].append({"chunk_id": chunk_id, "url": url})
-        e["pages"].add(url)
+        if chunk_id is not None:
+            e["mentions"].append({"chunk_id": chunk_id, "url": url})
+        if url is not None:
+            e["pages"].add(url)
         if score is not None:
             e["scores"].append(score)
 
