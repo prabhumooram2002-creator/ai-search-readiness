@@ -1043,3 +1043,48 @@ per the brief — engineers' appendix, never shown to a client.
 from a clean checkout at each of the three commits on `phase/10-report`.
 Penny-test verification (a non-engineer answering from S1+S2 alone) against
 a real site is the next step — see the PENNY TEST section below.
+
+---
+
+## PENNY TEST run #1 — real site (wickedgud.com), two bugs found and fixed (2026-07-13)
+
+Ran the actual pipeline end-to-end with `--fixes` against the real indexed
+site (89 pages, 393-394 chunks) — not synthetic fixtures. Two real bugs
+surfaced from reading the rendered `report.html`, neither caught by the 20
+unit tests (both are data-flow/integration issues, not pure-function bugs):
+
+1. S1's predicted-lift sentence falsely said "no fix artifacts were
+   generated" on a run that generated 6 (5 JSON-LD + 1 llms.txt + several
+   FAQ drafts). Cause: `top_deltas` was sourced from `action_plan[:5]`, but
+   this site's JS-invisible product pages (100% invisible, genuinely high
+   severity) filled every one of the 20 printed action-plan rows, pushing
+   the 2 real coverage-delta recommendations out of the row cap entirely —
+   not just ranked below, literally absent from the list `top_deltas` read
+   from. Fixed: source from every recommendation in `query_recommendations`
+   (pre-truncation), independent of the print cap.
+2. S5 trend regressions from chunk-structure changes rendered as a bare
+   "—" — `diff_snapshots`'s `chunk_structure` kind only carries a
+   `chunk_id`, which nothing resolved to a URL. Added
+   `resolve_chunk_structure_urls()` (pure, tested): resolves via
+   `chunk_lookup`, drops unresolvable rows — same rule S2 already follows.
+
+Fixed, 3 new tests (`test_chunk_structure_regression_resolves_to_url` +
+2 more), full suite 134 passed, 1 skipped. Re-ran against the same real
+site to confirm both fixes hold on actual output, not just the fixture
+tests.
+
+## PENNY TEST run #1 continued — reranker was the third real bottleneck
+
+The re-run stalled repeatedly at "Loading reranker BAAI/bge-reranker-v2-m3"
+— the same failure MODE as the GLiNER/GLiREL stalls in Backlog #4 (a large
+local model thrashing under this machine's RAM pressure, not erroring, just
+taking 30+ minutes to multi-hour to load). `src/simulator.py` already had a
+lighter fallback (`RERANKER_FALLBACK = cross-encoder/ms-marco-MiniLM-L-6-v2`,
+~80MB vs the ~2.2GB default) — but it only triggers on a load *exception*,
+never on slowness, so it was never reached. Fix: launch with
+`RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2` set directly — no
+code change needed, the env var already existed
+(`os.getenv("RERANKER_MODEL", ...)`), it just wasn't being used. Documented
+in README's "Notes on the local model stack" table and the provider
+env-var reference table alongside the other three memory swaps. Deleted
+the now-unused 2.2GB `BAAI/bge-reranker-v2-m3` cache.

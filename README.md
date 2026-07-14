@@ -85,7 +85,7 @@ data.
 
 The full local model set (BGE-M3 + GLiNER + spaCy-transformer + GLiREL +
 NLI cross-encoder + reranker) is **~6–8 GB combined** and was built assuming
-a machine with headroom for that. On a lighter machine, three env-var
+a machine with headroom for that. On a lighter machine, four env-var
 swaps keep everything working without a rewrite:
 
 | Constraint | Swap |
@@ -93,6 +93,7 @@ swaps keep everything working without a rewrite:
 | Low RAM for embeddings | `EMBED_PROVIDER=nvidia` — routes embeddings through the NVIDIA NIM free tier instead of loading BGE-M3 locally |
 | Low RAM for NER | `GLINER_MODEL=urchade/gliner_small-v2.1` (~400MB) instead of the ~1.8GB `large` default |
 | Low RAM for relation extraction | `RELATION_PROVIDER=llm` — extracts relations via the same LLM already used for claims, instead of loading the ~1.8GB GLiREL model. `SKIP_RELATIONS=1` is a last-resort bypass that returns no relationship edges at all. |
+| Low RAM for reranking | `RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2` (~80MB) instead of the ~2.2GB `bge-reranker-v2-m3` default. The code already falls back to this model on a load *error* — this swap picks it up front, which also avoids the multi-minute load stalls the 2.2GB model causes under memory pressure (it doesn't fail, it just thrashes). |
 
 ## Quick Start
 
@@ -138,6 +139,7 @@ Set in `.env` (see `.env.example`):
 | `SPACY_MODEL` | `en_core_web_trf` | `en_core_web_sm` (lighter, ~13MB) |
 | `RELATION_PROVIDER` | `glirel` | `llm` (routes through the configured LLM instead) |
 | `SKIP_RELATIONS` | unset | `1` — skip relation extraction entirely |
+| `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | `cross-encoder/ms-marco-MiniLM-L-6-v2` (lighter, ~80MB) |
 
 If you select an external provider but leave its key blank, the tool logs a
 warning and falls back to the local default. Reranking, NLI, NER, and (by
