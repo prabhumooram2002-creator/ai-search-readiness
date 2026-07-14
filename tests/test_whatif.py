@@ -84,6 +84,46 @@ def test_overlay_never_persists(monkeypatch, tmp_path):
     assert (store_dir / "data.bin").read_bytes() == b"persistent-vectors"
 
 
+def test_load_draft_retries_transient_permission_error(monkeypatch, tmp_path):
+    """A file written moments earlier (a Phase 8 fix artifact) can transiently
+    PermissionError on Windows while AV real-time scanning holds it — this
+    surfaced running the actual pipeline (BUILD_LOG PENNY TEST run #1: 5/5
+    FAQ-draft impact computations hit Errno 13). A short retry should absorb
+    a couple of transient failures and still return the real content."""
+    calls = {"n": 0}
+    real_read_text = Path.read_text
+
+    def flaky_read_text(self, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(wf.time, "sleep", lambda *_: None)  # don't actually wait in tests
+    draft = tmp_path / "flaky.md"
+    draft.write_text("real content", encoding="utf-8")
+
+    assert wf.load_draft(str(draft)) == "real content"
+    assert calls["n"] == 3
+
+
+def test_load_draft_raises_after_persistent_permission_error(monkeypatch, tmp_path):
+    """A genuine, non-transient permission problem must still raise — the
+    retry absorbs AV-scan-style blips, it doesn't mask real failures."""
+    def always_denied(self, *a, **kw):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_text", always_denied)
+    monkeypatch.setattr(wf.time, "sleep", lambda *_: None)
+    draft = tmp_path / "locked.md"
+    draft.write_text("x", encoding="utf-8")
+
+    import pytest
+    with pytest.raises(PermissionError):
+        wf.load_draft(str(draft))
+
+
 def test_draft_structure_flags_surface(monkeypatch, tmp_path):
     monkeypatch.setattr(wf.providers, "embed_texts", _embed)
     monkeypatch.setattr("src.fanout.fanout_distribution",

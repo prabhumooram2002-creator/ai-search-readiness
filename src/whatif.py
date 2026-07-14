@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,25 @@ def _tok(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
 
+def _read_text_with_retry(p: Path, attempts: int = 4, base_delay: float = 0.15) -> str:
+    """Windows-specific: a file written moments ago (e.g. a Phase 8 fix
+    artifact, read by 10a's impact chain seconds later) can transiently
+    hit PermissionError while antivirus real-time scanning still holds it —
+    not a real permissions problem, it clears in well under a second. A
+    short retry-with-backoff turns a spurious "not simulated" into the real
+    predicted delta without masking a genuine permissions failure (which
+    would still raise after all attempts)."""
+    last_exc: Optional[Exception] = None
+    for i in range(attempts):
+        try:
+            return p.read_text(encoding="utf-8-sig", errors="replace")
+        except PermissionError as exc:
+            last_exc = exc
+            if i < attempts - 1:
+                time.sleep(base_delay * (2 ** i))
+    raise last_exc
+
+
 def load_draft(path: str | Path) -> str:
     """Read a draft: .md/.txt directly, .docx via python-docx if installed."""
     p = Path(path)
@@ -41,7 +61,7 @@ def load_draft(path: str | Path) -> str:
         except ImportError:
             raise RuntimeError("python-docx not installed — convert the draft to "
                                ".md/.txt or `pip install python-docx`")
-    return p.read_text(encoding="utf-8-sig", errors="replace")
+    return _read_text_with_retry(p)
 
 
 def _hash_paths(paths: list[str]) -> dict[str, Optional[str]]:
